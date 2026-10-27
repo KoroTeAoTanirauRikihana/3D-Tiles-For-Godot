@@ -46,9 +46,10 @@ jobs:
         path: godot3dtiles/
 
   single:
+    # Fork (hcIfU, 28 Oct 2026): the single-precision job no longer waits on the double one - the maker's 5 Aug 2026
+    # master run failed in the double link (LNK1181 Cesium3DTilesSelection.lib) and skipped single. Single is the binary we run.
     name: Build Godot3DTiles Extension (Single Precision)
     runs-on: windows-latest
-    needs: double
 
     steps:
     - name: Checkout repository
