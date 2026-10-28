@@ -56,6 +56,10 @@ public:
 
 	void set_origin_type(int type);
 
+	bool get_level_at_origin() const;
+
+	void set_level_at_origin(bool levelAtOrigin);
+
 	double get_ecef_x() const;
 
 	void set_ecef_x(double x);
@@ -125,6 +129,10 @@ private:
 	
 	OriginType m_originType = OriginType::CartographicOrigin;
 	
+	bool m_levelAtOrigin = true;
+
+	void _update_transform();
+
 protected:
 	static void _bind_methods();
 

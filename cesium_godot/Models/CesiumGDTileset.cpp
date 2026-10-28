@@ -363,7 +363,7 @@ void Cesium3DTileset::update_tileset(const Transform3D& cameraTransform)
 
 	glm::dvec3 camPos;
 	if (isGeoreferenced) {
-		camPos = this->m_georeference->get_ecef_position();
+		camPos = CesiumMathUtils::to_glm_dvec3(this->m_georeference->get_tx_engine_to_ecef().xform(cameraTransform.origin));
 	}
 	else {
 		camPos = CesiumMathUtils::to_glm_dvec3(cameraTransform.origin);

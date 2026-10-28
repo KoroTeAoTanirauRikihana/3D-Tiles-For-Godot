@@ -102,6 +102,11 @@ env.Prepend(LIBPATH=vcpkgLibPath)
 root_dir_native = cesium_build_utils.get_root_dir_native()
 current_build_config = ""
 if (os.name  == cesium_build_utils.OS_WIN):
+    if ARGUMENTS.get("precision") == "double":
+        current_build_config = "RelWithDebInfo"
+    else:
+        current_build_config = cesium_build_utils.RELEASE_CONFIG
+else:
     current_build_config = cesium_build_utils.RELEASE_CONFIG
 # Library paths and linking
 libraries = [

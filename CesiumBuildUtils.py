@@ -300,7 +300,7 @@ def compile_native(argumentsDict):
     # TODO: Test if we can just do cmake --build for all platforms
     result = None
     if os.name == OS_WIN:
-        result = build_native_win()
+        result = build_native_win(argumentsDict)
     elif sys.platform == PLATFORM_MACOS:
         result = build_native_macos()
     elif os.name == OS_LINUX:
@@ -324,9 +324,9 @@ def build_native_macos():
     return subprocess.run(["cmake", "--build", "."])
 
 
-def build_native_win():
+def build_native_win(argumentsDict):
     # execute MSBuild
-    buildConfig: str = RELEASE_CONFIG
+    buildConfig: str = "RelWithDebInfo" if argumentsDict.get("precision") == "double" else RELEASE_CONFIG
     solutionName: str = "cesium-native.sln"
     msbuildPath: str = find_ms_build()
     if msbuildPath == "":

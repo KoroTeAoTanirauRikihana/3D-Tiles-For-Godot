@@ -94,6 +94,16 @@ CesiumGeoreference::OriginType CesiumGeoreference::get_origin_type_raw() const {
 
 void CesiumGeoreference::set_origin_type(int type) {
 	this->m_originType = static_cast<OriginType>(type);
+	this->_update_transform();
+}
+
+bool CesiumGeoreference::get_level_at_origin() const {
+	return this->m_levelAtOrigin;
+}
+
+void CesiumGeoreference::set_level_at_origin(bool levelAtOrigin) {
+	this->m_levelAtOrigin = levelAtOrigin;
+	this->_update_transform();
 }
 
 double CesiumGeoreference::get_ecef_x() const
@@ -284,6 +294,7 @@ void CesiumGeoreference::update_ecef_with_lla(glm::dvec3 lla) {
 	this->m_ecefPosition.x = (N + alt) * clat * clon;
 	this->m_ecefPosition.y = (N + alt) * clat * slon;
 	this->m_ecefPosition.z = (N * (1 - WGS84_E_SQR) + alt) * slat;
+	this->_update_transform();
 }
 
 
@@ -296,6 +307,7 @@ void CesiumGeoreference::move_origin(glm::dvec3 previousPosition)
 		// Now we can recalculate the same positions
 		tileset->move_origin(currEnginePos);
 	}
+	this->_update_transform();
 }
 
 void CesiumGeoreference::set_should_update_origin(bool updateOrigin)
@@ -334,7 +346,7 @@ Vector3 CesiumGeoreference::get_normal_at_surface_pos(const EcefVector3& ecef) c
 	const CesiumGeospatial::Ellipsoid& wgs84 = CesiumGeospatial::Ellipsoid::WGS84;
 	glm::dvec3 surfaceNormal = wgs84.geodeticSurfaceNormal(CesiumMathUtils::to_glm_dvec3(ecef));
 	Vector3 gdNormal = CesiumMathUtils::from_glm_vec3(surfaceNormal);
-	gdNormal = this->get_initial_tx_ecef_to_engine().xform(gdNormal);
+	gdNormal = this->get_tx_ecef_to_engine().basis.xform(gdNormal);
 	return gdNormal;
 }
 
@@ -412,11 +424,34 @@ void CesiumGeoreference::_bind_methods()
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "origin_type", PROPERTY_HINT_ENUM, "Cartographic Origin,True Origin"), "set_origin_type", "get_origin_type");
 	ClassDB::bind_integer_constant(get_class_static(), "OriginType", "CartographicOrigin", static_cast<int32_t>(OriginType::CartographicOrigin));
 	ClassDB::bind_integer_constant(get_class_static(), "OriginType", "TrueOrigin", static_cast<int32_t>(OriginType::TrueOrigin));
+
+	ClassDB::bind_method(D_METHOD("get_level_at_origin"), &CesiumGeoreference::get_level_at_origin);
+	ClassDB::bind_method(D_METHOD("set_level_at_origin", "level_at_origin"), &CesiumGeoreference::set_level_at_origin);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "level_at_origin"), "set_level_at_origin", "get_level_at_origin");
+}
+
+void CesiumGeoreference::_update_transform() {
+	if (!this->is_inside_tree()) {
+		return;
+	}
+	
+	this->set_rotation_degrees(Vector3(-90.0, 0.0, 0.0));
+	
+	if (this->m_originType == OriginType::CartographicOrigin && this->m_levelAtOrigin) {
+		Basis swap = this->get_basis(); // Basis after -90 X rotation
+		Basis eus = this->eus_at_ecef(Vector3(this->m_ecefPosition.x, this->m_ecefPosition.y, this->m_ecefPosition.z));
+		Basis m = Basis(
+			(swap.xform(eus.get_column(0))).normalized(), // East -> X
+			(swap.xform(eus.get_column(1))).normalized(), // Up -> Y
+			(swap.xform(eus.get_column(2))).normalized()  // South -> Z
+		);
+		this->set_global_basis(m.inverse() * this->get_global_basis());
+	}
 }
 
 void CesiumGeoreference::_enter_tree() {
 	this->m_initialOriginTransform = this->get_global_transform();
-	this->set_rotation_degrees(Vector3(-90.0, 0.0, 0.0));
 	this->m_originalEcefPosition = this->m_ecefPosition;
+	this->_update_transform();
 }
 	
