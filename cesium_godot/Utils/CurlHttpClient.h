@@ -62,14 +62,21 @@ struct RequestHandle_t {
 	}
 
 	void configure_http_method(HTTPClient::Method method) {
+		// The curl handle is reused for every request. CURLOPT_POST and CURLOPT_UPLOAD stay set on it until
+		// something clears them, so once any request had gone out as POST or PUT, every GET after it went out
+		// the same way: on 28 Oct 2026 the ion endpoint request for asset 2275207 arrived at api.cesium.com as a
+		// PUT and was answered 405 "PUT is not allowed". CURLOPT_HTTPGET resets both; every method sets its own.
 		switch (method) {
 			case HTTPClient::METHOD_POST:
-				curl_easy_setopt(this->curlHandle, CURLOPT_POST, 1);
+				curl_easy_setopt(this->curlHandle, CURLOPT_UPLOAD, 0L);
+				curl_easy_setopt(this->curlHandle, CURLOPT_POST, 1L);
 				break;
 			case HTTPClient::METHOD_PUT:
-				curl_easy_setopt(this->curlHandle, CURLOPT_UPLOAD, 1);
+				curl_easy_setopt(this->curlHandle, CURLOPT_POST, 0L);
+				curl_easy_setopt(this->curlHandle, CURLOPT_UPLOAD, 1L);
 				break;
 			default:
+				curl_easy_setopt(this->curlHandle, CURLOPT_HTTPGET, 1L);
 				break;
 		}
 	}

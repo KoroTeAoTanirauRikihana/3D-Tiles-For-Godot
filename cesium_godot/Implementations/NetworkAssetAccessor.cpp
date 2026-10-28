@@ -69,13 +69,16 @@ CesiumAsync::Future<std::shared_ptr<CesiumAsync::IAssetRequest>> NetworkAssetAcc
 	};
 	static_assert(STR_METHODS.size() == ENUM_METHODS.size());
 
+	// The index of the verb in STR_METHODS, found by position. The loop this replaces started at -1 and counted
+	// AFTER the comparison, so "GET" came out as -1 (refused as "not found") and every other verb mapped to the
+	// method one place before its own ("POST" became GET, "PUT" became POST) - 28 Oct 2026, read while an ion
+	// endpoint request went out as PUT and api.cesium.com answered 405 "PUT is not allowed".
 	int32_t idx = -1;
-
-	for (const char* method : STR_METHODS) {
-		if (verb == method) {
+	for (size_t i = 0; i < STR_METHODS.size(); ++i) {
+		if (verb == STR_METHODS[i]) {
+			idx = static_cast<int32_t>(i);
 			break;
 		}
-		idx++;
 	}
 
 	if (idx < 0 || idx >= ENUM_METHODS.size()) {
