@@ -855,8 +855,8 @@ void Cesium3DTileset::_exit_tree() {
 	}
 	// 1. The request threads: transfers in flight aborted, queued requests answered empty, all 16 threads joined.
 	//    The continuations those answers run (SimpleTaskProcessor runs them inline) end on the threads before this
-	//    returns; no request thread runs after it. A continuation that reads a mesh back (the tile collision,
-	//    get_faces) waits for the RenderingServer to flush on this thread, so it is flushed while we wait.
+	//    returns; no request thread runs after it. Those continuations do CPU work only (the tile's mesh, textures
+	//    and collision are made in prepareInMainThread); the RenderingServer is still flushed while we wait.
 	this->m_networkAccessor->stop([] {
 #if defined(CESIUM_GD_EXT)
 		RenderingServer::get_singleton()->force_sync();

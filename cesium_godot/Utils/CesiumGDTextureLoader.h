@@ -15,6 +15,10 @@ using namespace godot;
 class CesiumGDTextureLoader {
 
 public:
+	/// @brief CPU only (Image::create_from_data, Image::generate_mipmaps): safe on a load thread. No server is touched.
+	static Ref<Image> load_image(const CesiumGltf::ImageAsset& image, bool generateMipMaps, bool imageHasMipMaps);
+
+	/// @brief Creates the texture on the GPU: main thread only.
 	static Ref<ImageTexture> load_image_texture(const CesiumGltf::ImageAsset& image, bool generateMipMaps, bool imageHasMipMaps);
 private:
 	static Error try_get_image_format(int32_t channelCount, int32_t bytesPerChannel, Image::Format* outFormat);
