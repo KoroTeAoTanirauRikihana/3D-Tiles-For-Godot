@@ -857,7 +857,13 @@ void Cesium3DTileset::_exit_tree() {
 	//    The continuations those answers run (SimpleTaskProcessor runs them inline) end on the threads before this
 	//    returns; no request thread runs after it. A continuation that reads a mesh back (the tile collision,
 	//    get_faces) waits for the RenderingServer to flush on this thread, so it is flushed while we wait.
-	this->m_networkAccessor->stop([] { RenderingServer::get_singleton()->force_sync(); });
+	this->m_networkAccessor->stop([] {
+#if defined(CESIUM_GD_EXT)
+		RenderingServer::get_singleton()->force_sync();
+#elif defined(CESIUM_GD_MODULE)
+		RenderingServer::get_singleton()->sync();
+#endif
+	});
 	// 2. The Tileset: its destructor unloads every loaded tile through GodotPrepareRenderResources::free and
 	//    freeRaster, while the tile nodes are still children of this node.
 	CesiumAsync::AsyncSystem asyncSystem = this->m_activeTileset->getAsyncSystem();
