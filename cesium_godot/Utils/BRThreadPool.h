@@ -1,6 +1,8 @@
 #ifndef THREAD_POOL_H
 #define THREAD_POOL_H
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -21,6 +23,11 @@ public:
 			-> std::future<typename std::invoke_result_t<F,Args... >>;
 	~BRThreadPool();
 
+	// Stops the pool and joins every worker; the jobs already queued still run. Safe to call more than once.
+	// whileWaiting, if given, is called on the joining thread until the workers have ended (a worker may be waiting
+	// on that thread, e.g. for Godot's RenderingServer to flush).
+	void join(const std::function<void()> &whileWaiting = nullptr);
+
 	size_t size();
 
 private:
@@ -33,6 +40,7 @@ private:
 	std::mutex queue_mutex;
 	std::condition_variable condition;
 	bool stop;
+	std::atomic<size_t> running{ 0 };
 };
 
 inline BRThreadPool::BRThreadPool() :
@@ -40,6 +48,7 @@ inline BRThreadPool::BRThreadPool() :
 
 // the constructor just launches some amount of workers
 inline void BRThreadPool::init(size_t threads) {
+	running += threads;
 	for (size_t i = 0; i < threads; ++i)
 		workers.emplace_back(
 				[this] {
@@ -50,8 +59,10 @@ inline void BRThreadPool::init(size_t threads) {
 							std::unique_lock<std::mutex> lock(this->queue_mutex);
 							this->condition.wait(lock,
 									[this] { return this->stop || !this->tasks.empty(); });
-							if (this->stop && this->tasks.empty())
+							if (this->stop && this->tasks.empty()) {
+								this->running--;
 								return;
+							}
 							task = std::move(this->tasks.front());
 							this->tasks.pop();
 						}
@@ -84,15 +95,27 @@ auto BRThreadPool::enqueue(F &&f, Args &&...args)
 	return res;
 }
 
-// the destructor joins all threads
-inline BRThreadPool::~BRThreadPool() {
+inline void BRThreadPool::join(const std::function<void()> &whileWaiting) {
 	{
 		std::unique_lock<std::mutex> lock(queue_mutex);
 		stop = true;
 	}
 	condition.notify_all();
+	if (whileWaiting) {
+		while (running > 0) {
+			whileWaiting();
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
 	for (std::thread &worker : workers)
-		worker.join();
+		if (worker.joinable())
+			worker.join();
+	workers.clear();
+}
+
+// the destructor joins all threads
+inline BRThreadPool::~BRThreadPool() {
+	join();
 }
 
 inline size_t BRThreadPool::size() {

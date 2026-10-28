@@ -23,6 +23,7 @@ using namespace godot;
 
 #include "BRThreadPool.h"
 #include <curl/curl.h>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -110,6 +111,10 @@ public:
 	}
 
 	~CurlHttpClient() {
+		// The pool's threads end BEFORE the handles they run on are cleaned up. The members are destroyed in reverse
+		// order (the mutex and the handles first, the pool last), so without this a thread still in a transfer at
+		// quit used a cleaned-up curl handle, a destroyed deque and a destroyed mutex.
+		this->stop();
 		for (int32_t i = 0; i < this->m_activeHandles.size(); i++) {
 			this->m_activeHandles[i].easy_cleanup();
 		}
@@ -139,8 +144,28 @@ public:
 		this->send_request_same_thread(url, HTTPClient::METHOD_GET, callback, headers);
 	}
 
+	/// @brief Ends the request threads: no new job is taken, the transfers in flight are aborted, the queued jobs are
+	/// answered empty (status 0) without a transfer, and every thread is joined before this returns. Called by the
+	/// tileset in _exit_tree, so nothing runs on a request thread after the tileset has left the tree. whileWaiting
+	/// runs on the calling thread until the threads have ended (see BRThreadPool::join).
+	void stop(const std::function<void()> &whileWaiting = nullptr) {
+		{
+			std::lock_guard<std::mutex> lock(this->m_stopMutex);
+			this->m_stopping = true;
+		}
+		this->m_threadPool.join(whileWaiting);
+	}
+
 	void send_request(const char* url, HTTPClient::Method method, const HighLevelResponseCallback_t& callback, const std::vector<CesiumHeader_t>& headers) {
 		std::string urlCopy = url;
+		std::unique_lock<std::mutex> stopLock(this->m_stopMutex);
+		if (this->m_stopping) {
+			// The client is closed (a continuation of a request answered during stop() can ask for another one):
+			// answer at once, on this thread, instead of enqueueing on a stopped pool, which throws.
+			stopLock.unlock();
+			callback(0, PackedByteArray());
+			return;
+		}
 		// Everything the job needs is COPIED in. The lambda here used to open with [&, ...], which captured `method`
 		// by reference - a reference to a parameter of this function, gone by the time a pool thread ran the job.
 		// The thread read whatever lay on that stack slot: on 28 Oct 2026 api.cesium.com answered an ion endpoint
@@ -148,6 +173,10 @@ public:
 		// random, and no tile ever reached the tree. The handle is claimed on the worker, under the lock, so no more
 		// handles are ever in use than threads are running them.
 		this->m_threadPool.enqueue([this, urlCopy, headers, callback, method] {
+			if (this->m_stopping) {
+				callback(0, PackedByteArray());
+				return;
+			}
 			int32_t handleIdx = this->claim_available_handle_index();
 			RequestHandle_t& handle = this->m_activeHandles[handleIdx];
 			handle.configure_http_method(method);
@@ -185,6 +214,10 @@ private:
 		curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &CurlHttpClient::write_callback);
 		curl_easy_setopt(handle, CURLOPT_WRITEDATA, &buffer);
 		curl_easy_setopt(handle, CURLOPT_ACCEPT_ENCODING, "");
+		// Lets stop() abort a transfer in flight instead of waiting for it to end (curl asks at least once a second).
+		curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, &CurlHttpClient::progress_callback);
+		curl_easy_setopt(handle, CURLOPT_XFERINFODATA, this);
 
 
 		curl_slist* curlHeaders = nullptr;
@@ -210,13 +243,19 @@ private:
 		curl_slist_free_all(curlHeaders);
 		//Then from the result we can do error handling
 		if (code != CURLcode::CURLE_OK) {
-			ERR_PRINT(String("Could not make request to: ") + url + String(" error: ") + itos(code));
+			if (!this->m_stopping) {
+				ERR_PRINT(String("Could not make request to: ") + url + String(" error: ") + itos(code));
+			}
 			*outStatus = 0;
 			return PackedByteArray();
 		}
 
 		curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, outStatus);
 		return buffer;
+	}
+
+	static int progress_callback(void *clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+		return static_cast<CurlHttpClient *>(clientp)->m_stopping ? 1 : 0;
 	}
 
 	static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -260,6 +299,8 @@ private:
 	std::vector<CesiumHeader_t> m_defaultHeaders;
 	std::deque<RequestHandle_t> m_activeHandles;
 	std::mutex m_handleMutex;
+	std::mutex m_stopMutex;
+	std::atomic<bool> m_stopping{ false };
 };
 
 #endif // HIGH_LEVEL_HTTP_CLIENT

@@ -24,6 +24,10 @@ namespace Cesium3DTilesSelection {
 
 class OpaqueTilesetOptions;
 
+class NetworkAssetAccessor;
+
+class GodotPrepareRenderResources;
+
 
 class CesiumIonRasterOverlay;
 
@@ -120,6 +124,8 @@ public:
 	
 	void _enter_tree() override;
 
+	void _exit_tree() override;
+
 	void _ready() override;
 
 private:
@@ -145,6 +151,11 @@ private:
 	uint32_t update_property_usage_flags(const PropertyInfo& property) const;
 	
 	std::unique_ptr<Cesium3DTilesSelection::Tileset> m_activeTileset = nullptr;
+
+	// The externals the tileset must end in order in _exit_tree: the request threads, then the tiles.
+	std::shared_ptr<NetworkAssetAccessor> m_networkAccessor;
+
+	std::shared_ptr<GodotPrepareRenderResources> m_renderResources;
 
 
 	OpaqueTilesetOptions* m_tilesetConfig;
