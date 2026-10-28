@@ -251,11 +251,13 @@ def configure_native(argumentsDict):
     pinned = os.environ.get("EZVCPKG_COMMIT", "").strip()
     if pinned:
         import re
-        cml = Path(repoDirectory) / "CMakeLists.txt"
-        text = cml.read_text(encoding="utf-8")
+        cml = os.path.join(repoDirectory, "CMakeLists.txt")
+        with open(cml, "r", encoding="utf-8") as fh:
+            text = fh.read()
         new_text, count = re.subn(r"(ezvcpkg_fetch\(\s*COMMIT\s+)[0-9a-f]{40}", lambda m: m.group(1) + pinned, text, count=1)
         if count:
-            cml.write_text(new_text, encoding="utf-8")
+            with open(cml, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(new_text)
             print("EZVCPKG_COMMIT: cesium-native's ezvcpkg_fetch COMMIT rewritten to " + pinned)
         else:
             print("EZVCPKG_COMMIT is set but no ezvcpkg_fetch COMMIT line was found in cesium-native's CMakeLists.txt")
