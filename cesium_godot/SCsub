@@ -261,6 +261,11 @@ if (os.name == cesium_build_utils.OS_WIN):
             if _z in libraries and _z not in _on_disk:
                 libraries.remove(_z)
                 print("zlib: %s is not in the vcpkg install, not linked" % _z)
+    # 28 Oct 2026, run 40652097792: the newer libcurl (vcpkg afc0a2e0) leaves two Windows symbols unresolved
+    # at the extension's link - __imp_if_nametoindex (zonefrom_url) lives in iphlpapi.lib and
+    # __imp_InitSecurityInterfaceW (Curl_sspi_global_init) in secur32.lib. Both are Windows SDK import
+    # libraries the extension never named; curl's own CMake config links them for its consumers, SCons does not.
+    libraries.extend(["iphlpapi", "secur32"])
 elif sys.platform == cesium_build_utils.PLATFORM_MACOS:
     # Remove litehtml and gumbo from the libraries list - we'll use -force_load instead
     libraries.remove("litehtml")
