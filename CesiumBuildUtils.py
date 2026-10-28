@@ -328,8 +328,10 @@ def compile_native(argumentsDict):
         print(
             "Compiling for platform %s is not yet supported!" % os.name, file=sys.stderr
         )
-    if result.returncode != 0:
-        print("Error building Cesium Native: %s" % str(result.stderr))
+    if result is None or result.returncode != 0:
+        # Fail here, where the cause is, instead of 30 minutes later at the extension's link step.
+        print("Error building Cesium Native: return code %s" % (None if result is None else result.returncode), file=sys.stderr)
+        exit(1)
     print("Cleaning definitions on generated files...")
     clean_cesium_definitions()
     print("Finished building Cesium Native!")
@@ -344,18 +346,14 @@ def build_native_macos():
 
 
 def build_native_win(argumentsDict):
-    # execute MSBuild
     buildConfig: str = "RelWithDebInfo" if argumentsDict.get("precision") == "double" else RELEASE_CONFIG
-    solutionName: str = "cesium-native.sln"
-    msbuildPath: str = find_ms_build()
-    if msbuildPath == "":
-        print(
-            "Could not find MSBuild.exe, make sure to have Visual Studio installed",
-            file=sys.stderr,
-        )
-        return
-    releaseConfig = "/property:Configuration=%s" % buildConfig
-    return subprocess.run([msbuildPath, solutionName, releaseConfig])
+    # 28 Oct 2026: GitHub's windows-latest image (windows-2025-vs2026) makes CMake 4.4 generate for
+    # "Visual Studio 18 2026", whose solution file is cesium-native.slnx - there is no cesium-native.sln,
+    # so MSBuild answered "MSB1009: Project file does not exist", cesium-native never compiled, and the
+    # extension's link failed later with LNK1181 Cesium3DTilesSelection.lib (run 40639946574, both jobs).
+    # cmake --build drives whatever generator wrote the build files, .sln or .slnx, and --config picks the
+    # configuration on a multi-config generator the same way /property:Configuration did.
+    return subprocess.run(["cmake", "--build", ".", "--config", buildConfig, "--parallel"])
 
 
 def clean_cesium_definitions():
