@@ -113,6 +113,11 @@ void NetworkAssetAccessor::tick() noexcept
 {
 }
 
+void NetworkAssetAccessor::close()
+{
+	this->m_httpClient.close();
+}
+
 CesiumAsync::Future<std::shared_ptr<CesiumAsync::IAssetRequest>> NetworkAssetAccessor::process_request(HTTPClient::Method method, const CesiumAsync::AsyncSystem& asyncSystem, const std::string& url, const std::vector<THeader>& headers /*= {}*/)
 {
 	CesiumAsync::Promise<FutureResult_t> p_promise = asyncSystem.createPromise<FutureResult_t>();

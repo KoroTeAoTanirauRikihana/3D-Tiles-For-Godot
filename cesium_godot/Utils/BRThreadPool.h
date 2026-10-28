@@ -21,6 +21,9 @@ public:
 			-> std::future<typename std::invoke_result_t<F,Args... >>;
 	~BRThreadPool();
 
+	// Stops the pool and joins its threads; tasks already queued still run first. Safe to call twice.
+	void shutdown();
+
 	size_t size();
 
 private:
@@ -86,13 +89,18 @@ auto BRThreadPool::enqueue(F &&f, Args &&...args)
 
 // the destructor joins all threads
 inline BRThreadPool::~BRThreadPool() {
+	shutdown();
+}
+
+inline void BRThreadPool::shutdown() {
 	{
 		std::unique_lock<std::mutex> lock(queue_mutex);
 		stop = true;
 	}
 	condition.notify_all();
 	for (std::thread &worker : workers)
-		worker.join();
+		if (worker.joinable())
+			worker.join();
 }
 
 inline size_t BRThreadPool::size() {

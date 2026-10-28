@@ -70,6 +70,7 @@ using namespace godot;
 #include "CesiumAsync/GunzipAssetAccessor.h"
 #include <CesiumAsync/CachingAssetAccessor.h>
 #include "CesiumAsync/SqliteCache.h"
+#include <atomic>
 
 
 static int32_t tileCount = 0;
@@ -525,6 +526,7 @@ Cesium3DTilesSelection::TilesetExternals Cesium3DTileset::create_tileset_externa
 
 	auto cache = std::make_shared<CesiumAsync::SqliteCache>(spdlog::default_logger(), globalCachePath.utf8().get_data(), maxItems);
 	auto simpleAccessor = std::make_shared<NetworkAssetAccessor>();
+	this->m_networkAccessor = simpleAccessor;
 	auto cachedAccessor = std::make_shared<CesiumAsync::CachingAssetAccessor>(spdlog::default_logger(), simpleAccessor, cache, requestsPerCachePrune);
 	auto gunzipAccessor = std::make_shared<CesiumAsync::GunzipAssetAccessor>(
 		cachedAccessor
@@ -805,6 +807,45 @@ void Cesium3DTileset::_ready() {
 
 CesiumGeoreference* Cesium3DTileset::get_georeference_node() const {
 	return this->m_georeference;
+}
+
+// Quit (SceneTree::finalize) sends EXIT_TREE to every node while it and its children still live, and frees the nodes
+// only afterwards: the Cesium3DTile children in this node's PREDELETE, this node last, and the cesium-native Tileset
+// with it, as m_activeTileset is destroyed after ~Cesium3DTileset's body. Destroyed there, the Tileset unloaded its
+// tiles through GodotPrepareRenderResources::free, which handed call_deferred the Cesium3DTile nodes already freed (and
+// this node, half-destroyed), while the curl pool's threads went on running tile loads into prepareInLoadThread
+// against this node. So all of it ends here, in this order: the request threads are stopped and joined (an in-flight
+// request ends, a queued one is answered with status 0); the Tileset is destroyed while its nodes still exist; the
+// main-thread work its loads left queued is run until the Tileset's destruction completes. Nothing then runs on a
+// worker for this node. The Tileset is made again by update_tileset if the node comes back into a tree.
+void Cesium3DTileset::_exit_tree() {
+	if (this->m_activeTileset == nullptr) {
+		return;
+	}
+	this->m_closing = true;
+	if (this->m_networkAccessor != nullptr) {
+		this->m_networkAccessor->close();
+	}
+
+	CesiumAsync::AsyncSystem asyncSystem = this->m_activeTileset->getAsyncSystem();
+	auto destructionComplete = std::make_shared<std::atomic<bool>>(false);
+	this->m_activeTileset->getAsyncDestructionCompleteEvent().thenImmediately([destructionComplete]() {
+		destructionComplete->store(true);
+	});
+	this->m_activeTileset.reset();
+	// No worker is left to add to this queue, so it empties.
+	while (asyncSystem.dispatchOneMainThreadTask()) {
+	}
+	if (!destructionComplete->load()) {
+		WARN_PRINT("Cesium3DTileset: the tileset's loads did not all end at exit; their tiles are left to the engine.");
+	}
+
+	this->m_networkAccessor.reset();
+	this->m_closing = false;
+}
+
+bool Cesium3DTileset::is_closing() const {
+	return this->m_closing;
 }
 
 void Cesium3DTileset::_enter_tree() {

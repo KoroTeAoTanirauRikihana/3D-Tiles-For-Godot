@@ -24,6 +24,8 @@ using namespace godot;
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <mutex>
 
 using GodotResponseCallback_t = std::function<void(int32_t, const PackedByteArray&)>;
 using GodotHeader_t = std::pair<std::string, std::string>;
@@ -37,12 +39,22 @@ class GodotHttpClient {
 
 public:
 	GodotHttpClient() = default;
-	~GodotHttpClient() = default;
+	~GodotHttpClient() { close(); }
+
+	// No request starts after this; a request still queued, or sent after this, is answered at once with status 0.
+	// Every pool thread is joined before this returns.
+	void close() {
+		{
+			std::lock_guard<std::mutex> lock(m_closeMutex);
+			m_closing = true;
+		}
+		m_threadPool.shutdown();
+	}
 
 	void init_client(size_t maxThreads) {
 		m_threadPool.init(maxThreads);
 		std::string systemInfo = OS::get_singleton()->get_name().utf8().get_data();
-		auto architecture = OS::get_singleton()->get_processor_name().utf8().get_data();
+		std::string architecture = OS::get_singleton()->get_processor_name().utf8().get_data();
 		std::stringstream stream;
 		stream << "Godot3DTiles/1.0 (" << systemInfo << "; " << architecture << ")";
 		add_default_header({"User-Agent", stream.str()});
@@ -61,11 +73,21 @@ public:
 		std::vector<GodotHeader_t> allHeaders = m_defaultHeaders;
 		allHeaders.insert(allHeaders.end(), headers.begin(), headers.end());
 
-		m_threadPool.enqueue([this, urlCopy, method, callback, allHeaders] {
-			int32_t responseCode = 0;
-			PackedByteArray body = perform_request(urlCopy.c_str(), method, &responseCode, allHeaders);
-			callback(responseCode, body);
-		});
+		{
+			std::lock_guard<std::mutex> lock(m_closeMutex);
+			if (!m_closing) {
+				m_threadPool.enqueue([this, urlCopy, method, callback, allHeaders] {
+					int32_t responseCode = 0;
+					PackedByteArray body;
+					if (!m_closing) {
+						body = perform_request(urlCopy.c_str(), method, &responseCode, allHeaders);
+					}
+					callback(responseCode, body);
+				});
+				return;
+			}
+		}
+		callback(0, PackedByteArray());
 	}
 
 	void send_request_same_thread(const char* url, HTTPClient::Method method, const GodotResponseCallback_t& callback, const std::vector<GodotHeader_t>& headers) {
@@ -262,6 +284,8 @@ private:
 
 	BRThreadPool m_threadPool;
 	std::vector<GodotHeader_t> m_defaultHeaders;
+	std::mutex m_closeMutex;
+	std::atomic<bool> m_closing{ false };
 };
 
 #endif // GODOT_HTTP_CLIENT_H

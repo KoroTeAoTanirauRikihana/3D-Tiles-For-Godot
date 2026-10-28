@@ -172,7 +172,15 @@ void GodotPrepareRenderResources::free(Tile& tile, void* pLoadThreadResult, void
 {
 	const auto& tileId = tile.getTileID();
 	uint64_t hash = static_cast<uint64_t>(std::visit(CesiumVariantHash{}, tileId));
-	auto* instance = static_cast<Cesium3DTile*>(pMainThreadResult);
+	// A tile whose load never reached the main thread comes with its node as the load-thread result only.
+	auto* instance = static_cast<Cesium3DTile*>(pMainThreadResult != nullptr ? pMainThreadResult : pLoadThreadResult);
+	if (instance == nullptr) return;
+	// While the tileset ends (Cesium3DTileset::_exit_tree, main thread) the node is freed now: a deferred call would
+	// run after the tileset and its children are gone.
+	if (this->m_tileset->is_closing()) {
+		this->m_tileset->free_tile(instance, hash);
+		return;
+	}
 	this->m_tileset->call_deferred("free_tile", instance, hash);
 }
 
@@ -250,13 +258,16 @@ void* GodotPrepareRenderResources::prepareRasterInMainThread(CesiumRasterOverlay
 {
 	const CesiumGltf::ImageAsset& imageCesium = *rasterTile.getImage().get();
 	Ref<ImageTexture> godotTexture = CesiumGDTextureLoader::load_image_texture(imageCesium, false, true);
+	if (godotTexture.is_null()) return nullptr;
 	godotTexture->reference();
 	return static_cast<void*>(godotTexture.ptr());
 }
 
 void GodotPrepareRenderResources::freeRaster(const CesiumRasterOverlays::RasterOverlayTile& rasterTile, void* pLoadThreadResult, void* pMainThreadResult) noexcept
 {
-	auto* rasterMainThreadTexture = static_cast<ImageTexture*>(pMainThreadResult);
-	if (rasterMainThreadTexture == nullptr) return;
+	// The hold taken in prepareRasterInMainThread is dropped through a Ref<>, so the last holder frees the texture. A
+	// bare unreference() that reached zero freed nothing: the texture was left behind with no owner.
+	Ref<ImageTexture> rasterMainThreadTexture = static_cast<ImageTexture*>(pMainThreadResult);
+	if (rasterMainThreadTexture.is_null()) return;
 	rasterMainThreadTexture->unreference();
 }
