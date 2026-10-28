@@ -261,6 +261,20 @@ def configure_native(argumentsDict):
             print("EZVCPKG_COMMIT: cesium-native's ezvcpkg_fetch COMMIT rewritten to " + pinned)
         else:
             print("EZVCPKG_COMMIT is set but no ezvcpkg_fetch COMMIT line was found in cesium-native's CMakeLists.txt")
+    # 28 Oct 2026, run 40643965153: with vcpkg afc0a2e0 glm is 1.0.2, and cesium-native v0.52.1's
+    # CesiumGltf/src/Model.cpp stops on glm/detail/type_quat.inl(253) 'mat4_cast': identifier not found.
+    # cesium-native fixed it itself between v0.52.1 and v0.54.0 with one include in Model.cpp
+    # (CesiumGS/cesium-native compare v0.52.1...v0.54.0); the same line is added here after the clone.
+    model_cpp = os.path.join(repoDirectory, "CesiumGltf", "src", "Model.cpp")
+    if os.path.isfile(model_cpp):
+        with open(model_cpp, "r", encoding="utf-8") as fh:
+            model_text = fh.read()
+        needle = "#include <glm/geometric.hpp>\n"
+        if "#include <glm/gtc/quaternion.hpp>" not in model_text and needle in model_text:
+            model_text = model_text.replace(needle, needle + "#include <glm/gtc/quaternion.hpp> // cesium-native v0.54.0's fix for glm 1.0.2\n", 1)
+            with open(model_cpp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(model_text)
+            print("Model.cpp: added #include <glm/gtc/quaternion.hpp> (cesium-native's own fix for glm 1.0.2)")
     # Assume you already have the triplet (for now)
     triplet: str = determine_triplet()
     os.environ["VCPKG_TRIPLET"] = triplet
