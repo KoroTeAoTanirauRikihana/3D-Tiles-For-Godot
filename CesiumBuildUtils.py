@@ -254,6 +254,11 @@ def configure_native(argumentsDict):
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
             "-DGIT_LFS_SKIP_SMUDGE=1",
             "-DVCPKG_TRIPLET=%s" % triplet,
+            # 28 Oct 2026: the vcpkg commit cesium-native's ezvcpkg pins by default asks msys2 for
+            # msys2-runtime-3.5.4-2, which msys2 has removed (404 on every mirror), so every build died at
+            # configure. A newer vcpkg checkout asks for a runtime that exists. EZVCPKG_COMMIT in the
+            # environment (set by the workflow) chooses it; unset, the default pin stands as before.
+            *(["-DEZVCPKG_COMMIT=%s" % os.environ["EZVCPKG_COMMIT"]] if os.environ.get("EZVCPKG_COMMIT") else []),
             ".",
         ]
     )
