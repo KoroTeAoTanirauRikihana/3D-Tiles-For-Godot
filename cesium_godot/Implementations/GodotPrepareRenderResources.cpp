@@ -49,6 +49,14 @@ CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources> Go
 			return;
 		}
 
+		// The tileset is gone (detach_tileset): make no node for it.
+		Cesium3DTileset* tileset = this->m_tileset;
+		if (tileset == nullptr) {
+			TileLoadResultAndRenderResources droppedResult{ std::move(tileLoadResult), nullptr };
+			p_promise.resolve(droppedResult);
+			return;
+		}
+
 		Error err;
 		Ref<ArrayMesh> meshData = CesiumGDModelLoader::generate_meshes_from_model(*movedModel, &err);
 
@@ -106,14 +114,14 @@ CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources> Go
 		Quaternion rotation = CesiumMathUtils::from_glm_quat(glmRot);
 		CesiumGeoreference* geoReferenceNode = nullptr;
 
-		if (this->m_tileset->is_georeferenced(&geoReferenceNode)) {
+		if (tileset->is_georeferenced(&geoReferenceNode)) {
 			real_t scaleFactor = geoReferenceNode->get_scale_factor();
 			instance->set_scale({ scaleFactor, scaleFactor, scaleFactor });
 			translation *= scaleFactor;
 		}
 
 		// Avoid adding as child in the worker thread
-		instance->set_tileset_no_reparent(this->m_tileset);
+		instance->set_tileset_no_reparent(tileset);
 
 		// Save this for use later
 		instance->set_original_position(glmPos);
@@ -123,7 +131,7 @@ CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources> Go
 		translation = CesiumMathUtils::from_glm_vec3(glmPos);
 		instance->set_position(translation);
 		instance->set_rotation(eulerAngles);
-		if (this->m_tileset->get_create_physics_meshes()) {
+		if (tileset->get_create_physics_meshes()) {
 			instance->generate_tile_collision();
 		}
 
@@ -170,9 +178,20 @@ void* GodotPrepareRenderResources::prepareInMainThread(Tile& tile, void* pLoadTh
 
 void GodotPrepareRenderResources::free(Tile& tile, void* pLoadThreadResult, void* pMainThreadResult) noexcept
 {
+	// After detach_tileset the tileset node and its tile nodes may already be freed by Godot: touch neither. This
+	// used to run from ~Cesium3DTileset, after Godot had deleted the tile children, and turned a freed
+	// Cesium3DTile* into a Variant for call_deferred on a tileset in its destructor - the access violation at quit.
+	if (this->m_tileset == nullptr) return;
+	// A tile whose main-thread step never ran (in flight when the tileset was destroyed) hands back its load-thread
+	// node; it was never added to the tree, so it is deleted here instead of leaking.
+	auto* instance = static_cast<Cesium3DTile*>(pMainThreadResult != nullptr ? pMainThreadResult : pLoadThreadResult);
+	if (instance == nullptr) return;
+	if (instance->get_parent() == nullptr) {
+		memdelete(instance);
+		return;
+	}
 	const auto& tileId = tile.getTileID();
 	uint64_t hash = static_cast<uint64_t>(std::visit(CesiumVariantHash{}, tileId));
-	auto* instance = static_cast<Cesium3DTile*>(pMainThreadResult);
 	this->m_tileset->call_deferred("free_tile", instance, hash);
 }
 
@@ -183,7 +202,8 @@ void GodotPrepareRenderResources::attachRasterInMainThread(const Tile& tile, int
 	auto* meshInstance = static_cast<Cesium3DTile*>(rawRenderResources);
 	if (meshInstance == nullptr) return;
 
-	Ref<ImageTexture> godotTexture = static_cast<ImageTexture*>(pMainThreadRendererResources);
+	if (pMainThreadRendererResources == nullptr) return;
+	Ref<ImageTexture> godotTexture = *static_cast<Ref<ImageTexture>*>(pMainThreadRendererResources);
 	std::string key = rasterTile.getOverlay().getName();
 
 	//Get all primitives (surfaces) in the mesh tile
@@ -250,13 +270,13 @@ void* GodotPrepareRenderResources::prepareRasterInMainThread(CesiumRasterOverlay
 {
 	const CesiumGltf::ImageAsset& imageCesium = *rasterTile.getImage().get();
 	Ref<ImageTexture> godotTexture = CesiumGDTextureLoader::load_image_texture(imageCesium, false, true);
-	godotTexture->reference();
-	return static_cast<void*>(godotTexture.ptr());
+	if (godotTexture.is_null()) return nullptr;
+	// Held as a Ref<> (it was a raw ImageTexture* with a manual reference()), so freeRaster releases it the way
+	// Godot does: the texture is deleted when the last reference goes, never unreferenced through a stale pointer.
+	return static_cast<void*>(new Ref<ImageTexture>(godotTexture));
 }
 
 void GodotPrepareRenderResources::freeRaster(const CesiumRasterOverlays::RasterOverlayTile& rasterTile, void* pLoadThreadResult, void* pMainThreadResult) noexcept
 {
-	auto* rasterMainThreadTexture = static_cast<ImageTexture*>(pMainThreadResult);
-	if (rasterMainThreadTexture == nullptr) return;
-	rasterMainThreadTexture->unreference();
+	delete static_cast<Ref<ImageTexture>*>(pMainThreadResult);
 }

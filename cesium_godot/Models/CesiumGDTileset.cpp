@@ -41,6 +41,7 @@
 #include <godot_cpp/classes/collision_shape3d.hpp>
 #include <godot_cpp/core/error_macros.hpp>
 #include <godot_cpp/classes/scene_tree.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
 using namespace godot;
 #elif defined(CESIUM_GD_MODULE)
 #include "scene/3d/mesh_instance_3d.h"
@@ -52,6 +53,7 @@ using namespace godot;
 #include "core/io/dir_access.h"
 #include "scene/3d/physics/collision_shape_3d.h"
 #include "core/error/error_macros.h"
+#include "servers/rendering_server.h"
 #endif
 
 
@@ -227,7 +229,15 @@ Cesium3DTileset::Cesium3DTileset()
 
 
 Cesium3DTileset::~Cesium3DTileset() {
-	// Trivial, but GCC complains if this is not in the implementation file
+	// _exit_tree has already ended the tileset (see there). Should one still be alive here, Godot has freed the tile
+	// children by now: detach first, so destroying it touches no node, and join the request threads before it goes.
+	if (this->m_renderResources != nullptr) {
+		this->m_renderResources->detach_tileset();
+	}
+	if (this->m_networkAccessor != nullptr) {
+		this->m_networkAccessor->stop();
+	}
+	this->m_activeTileset.reset();
 }
 
 void Cesium3DTileset::set_maximum_screen_space_error(real_t error)
@@ -346,7 +356,12 @@ bool Cesium3DTileset::get_create_physics_meshes() const
 
 void Cesium3DTileset::update_tileset(const Transform3D& cameraTransform)
 {
-	
+	// Out of the tree the tileset is ended (_exit_tree) and must not start again: no viewport, and no request
+	// thread may run for a node that has left the tree.
+	if (!this->is_inside_tree()) {
+		return;
+	}
+
 	bool isGeoreferenced = this->is_georeferenced(&this->m_georeference);
 	if (this->m_activeTileset == nullptr) {
 		if (isGeoreferenced) {
@@ -506,6 +521,11 @@ void Cesium3DTileset::load_tileset()
 		Node* currChild = this->get_child(i);
 		CesiumIonRasterOverlay* overlay = Object::cast_to<CesiumIonRasterOverlay>(currChild);
 		if (overlay == nullptr) continue;
+		// Loaded again after leaving and re-entering the tree: the overlay already exists, add it to the new Tileset.
+		if (overlay->get_overlay_instance().get() != nullptr) {
+			this->add_overlay(overlay);
+			continue;
+		}
 		overlay->add_to_tileset(this);
 	}
 
@@ -525,6 +545,7 @@ Cesium3DTilesSelection::TilesetExternals Cesium3DTileset::create_tileset_externa
 
 	auto cache = std::make_shared<CesiumAsync::SqliteCache>(spdlog::default_logger(), globalCachePath.utf8().get_data(), maxItems);
 	auto simpleAccessor = std::make_shared<NetworkAssetAccessor>();
+	this->m_networkAccessor = simpleAccessor;
 	auto cachedAccessor = std::make_shared<CesiumAsync::CachingAssetAccessor>(spdlog::default_logger(), simpleAccessor, cache, requestsPerCachePrune);
 	auto gunzipAccessor = std::make_shared<CesiumAsync::GunzipAssetAccessor>(
 		cachedAccessor
@@ -533,6 +554,7 @@ Cesium3DTilesSelection::TilesetExternals Cesium3DTileset::create_tileset_externa
 	auto taskProcessor = std::make_shared<SimpleTaskProcessor>();
 	CesiumAsync::AsyncSystem asyncSystem(taskProcessor);
 	auto renderResourcesProvider = std::make_shared<GodotPrepareRenderResources>(this);
+	this->m_renderResources = renderResourcesProvider;
 	auto creditSystem = std::make_shared<CesiumUtility::CreditSystem>();
 	CesiumGDCreditSystem::get_singleton(this)->add_credit_system(creditSystem);
 	
@@ -822,5 +844,32 @@ void Cesium3DTileset::_enter_tree() {
 	this->reparent(globe, true);
 	this->set_rotation_degrees(Vector3(90.0, 0.0, 0.0));
 	this->set_owner(globe->get_parent_node_3d());
+}
+
+void Cesium3DTileset::_exit_tree() {
+	// At quit Godot calls _exit_tree on every node (children first) and only then deletes them, the tile children
+	// before this node's destructor. So the tileset ends HERE, while every node and texture it references still
+	// exists, in this order:
+	if (this->m_activeTileset == nullptr) {
+		return;
+	}
+	// 1. The request threads: transfers in flight aborted, queued requests answered empty, all 16 threads joined.
+	//    The continuations those answers run (SimpleTaskProcessor runs them inline) end on the threads before this
+	//    returns; no request thread runs after it. A continuation that reads a mesh back (the tile collision,
+	//    get_faces) waits for the RenderingServer to flush on this thread, so it is flushed while we wait.
+	this->m_networkAccessor->stop([] { RenderingServer::get_singleton()->force_sync(); });
+	// 2. The Tileset: its destructor unloads every loaded tile through GodotPrepareRenderResources::free and
+	//    freeRaster, while the tile nodes are still children of this node.
+	CesiumAsync::AsyncSystem asyncSystem = this->m_activeTileset->getAsyncSystem();
+	CesiumAsync::SharedFuture<void> destroyed = this->m_activeTileset->getAsyncDestructionCompleteEvent();
+	this->m_activeTileset.reset();
+	// 3. The tiles that were in flight: their last step waits on the main-thread queue, which nothing dispatches once
+	//    the Tileset is gone. Run it now, until the content is all unloaded or the queue is empty.
+	while (!destroyed.isReady() && asyncSystem.dispatchOneMainThreadTask()) {
+	}
+	// 4. From here on nothing in the render resources touches this node or a tile node.
+	this->m_renderResources->detach_tileset();
+	this->m_renderResources.reset();
+	this->m_networkAccessor.reset();
 }
 
