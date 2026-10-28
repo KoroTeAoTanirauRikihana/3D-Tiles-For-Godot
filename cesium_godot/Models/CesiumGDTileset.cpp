@@ -397,6 +397,7 @@ void Cesium3DTileset::update_tileset(const Transform3D& cameraTransform)
 
 	const Cesium3DTilesSelection::ViewUpdateResult& updateResult = this->m_activeTileset->updateViewGroup(this->m_activeTileset->getDefaultViewGroup(), { currentViewState });
 	this->m_activeTileset->loadTiles();
+	this->m_activeTileset->getAsyncSystem().dispatchMainThreadTasks();
 
 	for (CesiumUtility::IntrusivePointer<const Cesium3DTilesSelection::Tile> tile : updateResult.tilesToRenderThisFrame) {
 		this->render_tile_as_node(*tile);
