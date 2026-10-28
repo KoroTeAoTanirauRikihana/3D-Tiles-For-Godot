@@ -41,6 +41,9 @@ public:
 
 	void tick() noexcept override;
 
+	/// @brief Ends the request threads and joins them (the client's stop()); every later request is answered empty.
+	void stop(const std::function<void()> &whileWaiting = nullptr);
+
 private:
 	CesiumAsync::Future<std::shared_ptr<CesiumAsync::IAssetRequest>> process_request(HTTPClient::Method method, const CesiumAsync::AsyncSystem &asyncSystem, const std::string &url, const std::vector<THeader> &headers = {});
 

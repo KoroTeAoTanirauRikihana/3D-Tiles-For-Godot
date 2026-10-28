@@ -41,14 +41,8 @@ using namespace godot;
 constexpr int32_t RGBA_CHANNEL_COUNT = 4;
 constexpr int32_t RGB_CHANNEL_COUNT = 3;
 
-Ref<ArrayMesh> CesiumGDModelLoader::generate_meshes_from_model(const CesiumGltf::Model& model, Error* error)
-{	
-	std::vector<CesiumGltf::Mesh> gltfMeshes = model.meshes;
-
-	std::unordered_map<int32_t, Ref<StandardMaterial3D>> materialsMap;
-
-	Ref<ArrayMesh> meshInstance = memnew(ArrayMesh);
-
+Ref<Shader> CesiumGDModelLoader::load_texture_transform_shader()
+{
 	Ref<Shader> texture_transform_shader = godot::ResourceLoader::get_singleton()->load("res://Shaders/spatial_texture_rotation.gdshader");
 	texture_transform_shader.instantiate();
 	if (!texture_transform_shader.is_valid()) {
@@ -82,25 +76,39 @@ Ref<ArrayMesh> CesiumGDModelLoader::generate_meshes_from_model(const CesiumGltf:
 
 		texture_transform_shader->set_code(code);
 	}
+	return texture_transform_shader;
+}
 
-	*error = Error::OK;
+// LOAD THREAD (a request thread: SimpleTaskProcessor runs cesium-native's worker tasks inline). Only CPU work here:
+// the surface arrays, the material values and each texture as an Image. The ArrayMesh, StandardMaterial3D,
+// ImageTexture and Shader are made in create_mesh, on the main thread (Godot, "Thread-safe APIs": "You should avoid
+// calling functions involving direct interaction with the GPU on other threads, such as creating new textures or
+// modifying and retrieving image data").
+Error CesiumGDModelLoader::decode_model(const CesiumGltf::Model& model, CesiumGDMeshData* out)
+{
+	const std::vector<CesiumGltf::Mesh>& gltfMeshes = model.meshes;
+
+	Error error = Error::OK;
 	for (const CesiumGltf::Mesh& mesh : gltfMeshes) {
 		int32_t surfaceIndex = 0;
 		for (const CesiumGltf::MeshPrimitive& primitive : mesh.primitives) {
 
 			const CesiumGltf::Model* modelReference = &model;
 
-			// Create the material for the gltf
-			Ref<StandardMaterial3D> godotMaterial = memnew(StandardMaterial3D);
+			CesiumGDPrimitiveData primitiveData;
+			primitiveData.surfaceIndex = surfaceIndex;
+			primitiveData.primitiveType = cesium_to_godot_primitive_mode(primitive.mode);
+
+			// The material for the gltf, as values
 			const CesiumGltf::Material& mat = modelReference->materials.at(primitive.material);
-			copy_material_properties(mat, godotMaterial, *modelReference);
+			primitiveData.material = decode_material(mat, *modelReference);
 
 			// Then copy all the other properties defined in the file
 			Vector<Vector3> vertices = get_attribute_from_primitive<Vector3>(primitive, model, "POSITION");
 
 			if (vertices.is_empty()) {
 				ERR_PRINT("Mesh did not have a vertex buffer!");
-				return meshInstance;
+				return error;
 			}
 
 			Vector<Vector3> normals = get_attribute_from_primitive<Vector3>(primitive, model, "NORMAL", [&](Vector3& normal) {
@@ -126,7 +134,7 @@ Ref<ArrayMesh> CesiumGDModelLoader::generate_meshes_from_model(const CesiumGltf:
     		});
 			}
 
-			Vector<int32_t> indexBuffer = get_index_buffer_from_primitive(primitive, model, error);
+			Vector<int32_t> indexBuffer = get_index_buffer_from_primitive(primitive, model, &error);
 
 			// Default index buffer if it is empty
 			if (indexBuffer.is_empty()) {
@@ -140,11 +148,6 @@ Ref<ArrayMesh> CesiumGDModelLoader::generate_meshes_from_model(const CesiumGltf:
 			// We need to do some extra stuff if we're on the extension
 			#if defined(CESIUM_GD_EXT)
 			arrays = generate_array_mesh_ext(vertices, indexBuffer, normals, textureCoords, textureCoords1);
-
-			if (normals.is_empty()) {
-				godotMaterial->set_shading_mode(BaseMaterial3D::ShadingMode::SHADING_MODE_UNSHADED);
-			}
-			
 			#elif defined(CESIUM_GD_MODULE)
 			arrays.resize(ArrayMesh::ARRAY_MAX);
 			arrays[ArrayMesh::ARRAY_VERTEX] = vertices;
@@ -152,9 +155,6 @@ Ref<ArrayMesh> CesiumGDModelLoader::generate_meshes_from_model(const CesiumGltf:
 
 			if (!normals.is_empty()) {
 				arrays[ArrayMesh::ARRAY_NORMAL] = normals;
-			}
-			else {
-				godotMaterial->set_shading_mode(BaseMaterial3D::ShadingMode::SHADING_MODE_UNSHADED);
 			}
 
 			if (!textureCoords.is_empty()) {
@@ -165,65 +165,89 @@ Ref<ArrayMesh> CesiumGDModelLoader::generate_meshes_from_model(const CesiumGltf:
 				arrays[ArrayMesh::ARRAY_TEX_UV2] = textureCoords1;
 			}
 			#endif
-			
-			Ref<Material> finalMaterial = godotMaterial;
-			if (modelReference->hasExtension<CesiumGltf::ExtensionKhrMaterialsUnlit>()) {
-				godotMaterial->set_shading_mode(BaseMaterial3D::ShadingMode::SHADING_MODE_UNSHADED);
-			}
+			primitiveData.arrays = arrays;
+
+			// No normals, or KHR_materials_unlit: drawn unshaded
+			primitiveData.unshaded = normals.is_empty() || modelReference->hasExtension<CesiumGltf::ExtensionKhrMaterialsUnlit>();
 
 			if (modelReference->hasExtension<CesiumGltf::ExtensionKhrTextureTransform>()) {
 				const CesiumGltf::ExtensionKhrTextureTransform* texture_transform_ext = modelReference->getExtension<CesiumGltf::ExtensionKhrTextureTransform>();
 				if (texture_transform_ext) {
 					const std::vector<double>& offsetVec = texture_transform_ext->offset;
 					const std::vector<double>& scaleVec = texture_transform_ext->scale;
-					float rotation_value = texture_transform_ext->rotation;
 
-					Vector3 offsetVector3 = Vector3(0, 0, 0);
-					Vector3 scaleVector3 = Vector3(1, 1, 1);
+					primitiveData.hasTextureTransform = true;
+					primitiveData.uvRotation = texture_transform_ext->rotation;
 
 					if (offsetVec.size() == 2) {
-						offsetVector3 = Vector3(offsetVec[0], offsetVec[1], 0);
+						primitiveData.hasUvOffset = true;
+						primitiveData.uvOffset = Vector3(offsetVec[0], offsetVec[1], 0);
 					}
 
 					if (scaleVec.size() == 2) {
-						scaleVector3 = Vector3(scaleVec[0], scaleVec[1], 1);
+						primitiveData.hasUvScale = true;
+						primitiveData.uvScale = Vector3(scaleVec[0], scaleVec[1], 1);
 					}
-
-					if (texture_transform_shader.is_valid()) {
-						Ref<ShaderMaterial> shaderMat;
-						shaderMat.instantiate();
-						shaderMat->set_shader(texture_transform_shader);
-
-						Ref<Texture2D> albedo_texture_mat = godotMaterial->get_texture(BaseMaterial3D::TEXTURE_ALBEDO);
-						shaderMat->set_shader_parameter("albedo_texture", albedo_texture_mat);
-
-						shaderMat->set_shader_parameter("uv_offset", offsetVector3);
-						shaderMat->set_shader_parameter("uv_scale", scaleVector3);
-						shaderMat->set_shader_parameter("uv_rotation", rotation_value);
-						
-						finalMaterial = shaderMat;
-					}
-					else {
-
-						if (offsetVec.size() == 2) {
-							godotMaterial->set_uv1_offset(offsetVector3);
-						}
-
-
-						if (scaleVec.size() == 2) {
-							godotMaterial->set_uv1_scale(scaleVector3);
-						}
-					}
-					
 				}
 			}
 
-			*error = apply_surface_to_mesh(primitive, meshInstance, arrays);
-			meshInstance->surface_set_material(surfaceIndex, finalMaterial);
-			materialsMap.insert_or_assign(primitive.material, finalMaterial);
+			out->primitives.push_back(std::move(primitiveData));
 
 			surfaceIndex++;
 		}
+	}
+	return error;
+}
+
+// MAIN THREAD (GodotPrepareRenderResources::prepareInMainThread): every server object of the tile is made here.
+Ref<ArrayMesh> CesiumGDModelLoader::create_mesh(const CesiumGDMeshData& meshData)
+{
+	Ref<ArrayMesh> meshInstance = memnew(ArrayMesh);
+	Ref<Shader> texture_transform_shader;
+
+	for (const CesiumGDPrimitiveData& primitiveData : meshData.primitives) {
+		Ref<StandardMaterial3D> godotMaterial = memnew(StandardMaterial3D);
+		apply_material(primitiveData.material, godotMaterial);
+
+		if (primitiveData.unshaded) {
+			godotMaterial->set_shading_mode(BaseMaterial3D::ShadingMode::SHADING_MODE_UNSHADED);
+		}
+
+		Ref<Material> finalMaterial = godotMaterial;
+		if (primitiveData.hasTextureTransform) {
+			if (texture_transform_shader.is_null()) {
+				texture_transform_shader = load_texture_transform_shader();
+			}
+
+			if (texture_transform_shader.is_valid()) {
+				Ref<ShaderMaterial> shaderMat;
+				shaderMat.instantiate();
+				shaderMat->set_shader(texture_transform_shader);
+
+				Ref<Texture2D> albedo_texture_mat = godotMaterial->get_texture(BaseMaterial3D::TEXTURE_ALBEDO);
+				shaderMat->set_shader_parameter("albedo_texture", albedo_texture_mat);
+
+				shaderMat->set_shader_parameter("uv_offset", primitiveData.uvOffset);
+				shaderMat->set_shader_parameter("uv_scale", primitiveData.uvScale);
+				shaderMat->set_shader_parameter("uv_rotation", primitiveData.uvRotation);
+
+				finalMaterial = shaderMat;
+			}
+			else {
+
+				if (primitiveData.hasUvOffset) {
+					godotMaterial->set_uv1_offset(primitiveData.uvOffset);
+				}
+
+
+				if (primitiveData.hasUvScale) {
+					godotMaterial->set_uv1_scale(primitiveData.uvScale);
+				}
+			}
+		}
+
+		meshInstance->add_surface_from_arrays(primitiveData.primitiveType, primitiveData.arrays);
+		meshInstance->surface_set_material(primitiveData.surfaceIndex, finalMaterial);
 	}
 	return meshInstance;
 }
@@ -424,35 +448,31 @@ Error CesiumGDModelLoader::apply_surface_to_mesh(const CesiumGltf::MeshPrimitive
 
 Error CesiumGDModelLoader::copy_material_properties(const CesiumGltf::Material& cesiumMaterial, Ref<StandardMaterial3D>& godotMaterial, const CesiumGltf::Model& modelReference)
 {
-	set_colors_and_texture(cesiumMaterial, godotMaterial, modelReference);
-
-	BaseMaterial3D::CullMode cullMode = cesiumMaterial.doubleSided ? BaseMaterial3D::CULL_DISABLED : BaseMaterial3D::CULL_FRONT;
-	BaseMaterial3D::Transparency alphaMode;
-
-	if (cesiumMaterial.alphaMode == CesiumGltf::Material::AlphaMode::OPAQUE) {
-		alphaMode = BaseMaterial3D::Transparency::TRANSPARENCY_DISABLED;
-	}
-	else if (cesiumMaterial.alphaMode == CesiumGltf::Material::AlphaMode::BLEND) {
-		alphaMode = BaseMaterial3D::Transparency::TRANSPARENCY_ALPHA;
-	}
-	else {
-		alphaMode = BaseMaterial3D::Transparency::TRANSPARENCY_ALPHA_SCISSOR;
-	}
-
-	godotMaterial->set_transparency(alphaMode);
-	godotMaterial->set_cull_mode(cullMode);
-	godotMaterial->set_name(cesiumMaterial.name.c_str());
-	godotMaterial->set_alpha_antialiasing(BaseMaterial3D::ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE);
-	godotMaterial->set_shading_mode(BaseMaterial3D::SHADING_MODE_PER_PIXEL);
-	godotMaterial->set_flag(BaseMaterial3D::FLAG_USE_TEXTURE_REPEAT, false);
+	apply_material(decode_material(cesiumMaterial, modelReference), godotMaterial);
 	return Error::OK;
 }
 
-void CesiumGDModelLoader::set_colors_and_texture(const CesiumGltf::Material& cesiumMaterial, Ref<StandardMaterial3D>& godotMaterial, const CesiumGltf::Model& modelReference)
+CesiumGDMaterialData CesiumGDModelLoader::decode_material(const CesiumGltf::Material& cesiumMaterial, const CesiumGltf::Model& modelReference)
 {
-	if (!cesiumMaterial.pbrMetallicRoughness.has_value()) {
-		return;
+	CesiumGDMaterialData materialData;
+
+	materialData.cullMode = cesiumMaterial.doubleSided ? BaseMaterial3D::CULL_DISABLED : BaseMaterial3D::CULL_FRONT;
+
+	if (cesiumMaterial.alphaMode == CesiumGltf::Material::AlphaMode::OPAQUE) {
+		materialData.transparency = BaseMaterial3D::Transparency::TRANSPARENCY_DISABLED;
 	}
+	else if (cesiumMaterial.alphaMode == CesiumGltf::Material::AlphaMode::BLEND) {
+		materialData.transparency = BaseMaterial3D::Transparency::TRANSPARENCY_ALPHA;
+	}
+	else {
+		materialData.transparency = BaseMaterial3D::Transparency::TRANSPARENCY_ALPHA_SCISSOR;
+	}
+	materialData.name = cesiumMaterial.name.c_str();
+
+	if (!cesiumMaterial.pbrMetallicRoughness.has_value()) {
+		return materialData;
+	}
+	materialData.hasPbr = true;
 
 	const std::vector<double>& baseColorFactor = cesiumMaterial.pbrMetallicRoughness->baseColorFactor;
 
@@ -460,26 +480,50 @@ void CesiumGDModelLoader::set_colors_and_texture(const CesiumGltf::Material& ces
 		// RGBA constructor
 		Color baseColor(baseColorFactor.at(0), baseColorFactor.at(1), baseColorFactor.at(2), baseColorFactor.at(3));
 		// GLTF uses linear space, Godot uses sRGB when presenting it to the screen
-		baseColor = baseColor.linear_to_srgb();
-		godotMaterial->set_albedo(baseColor);
+		materialData.albedo = baseColor.linear_to_srgb();
+		materialData.hasAlbedo = true;
 	}
 
 	// TODO: Check if specular or metallic here
-	godotMaterial->set_specular(cesiumMaterial.pbrMetallicRoughness->metallicFactor);
-	// godotMaterial->set_metallic(cesiumMaterial.pbrMetallicRoughness->metallicFactor);
-	godotMaterial->set_roughness(cesiumMaterial.pbrMetallicRoughness->roughnessFactor);
+	materialData.specular = cesiumMaterial.pbrMetallicRoughness->metallicFactor;
+	materialData.roughness = cesiumMaterial.pbrMetallicRoughness->roughnessFactor;
 
-	// TODO: Texture
 	const std::optional<CesiumGltf::TextureInfo>& baseTexture = cesiumMaterial.pbrMetallicRoughness->baseColorTexture;
 	if (!baseTexture.has_value()) {
-		return;
+		return materialData;
 	}
-	// Something to get the texture
 
 	const int32_t imageIndex = modelReference.textures.at(baseTexture->index).source;
 	const CesiumGltf::Image& image = modelReference.images.at(imageIndex);
-	Ref<Texture> textureToUse = CesiumGDTextureLoader::load_image_texture(*image.pAsset.get(), true, false);
-	godotMaterial->set_texture(BaseMaterial3D::TEXTURE_ALBEDO, textureToUse);
+	if (image.pAsset == nullptr) {
+		return materialData;
+	}
+	// The Image only (CPU); its ImageTexture is created in apply_material, on the main thread
+	materialData.albedoImage = CesiumGDTextureLoader::load_image(*image.pAsset.get(), true, false);
+	return materialData;
+}
+
+void CesiumGDModelLoader::apply_material(const CesiumGDMaterialData& materialData, Ref<StandardMaterial3D>& godotMaterial)
+{
+	if (materialData.hasPbr) {
+		if (materialData.hasAlbedo) {
+			godotMaterial->set_albedo(materialData.albedo);
+		}
+		godotMaterial->set_specular(materialData.specular);
+		// godotMaterial->set_metallic(cesiumMaterial.pbrMetallicRoughness->metallicFactor);
+		godotMaterial->set_roughness(materialData.roughness);
+		if (materialData.albedoImage.is_valid()) {
+			Ref<Texture> textureToUse = ImageTexture::create_from_image(materialData.albedoImage);
+			godotMaterial->set_texture(BaseMaterial3D::TEXTURE_ALBEDO, textureToUse);
+		}
+	}
+
+	godotMaterial->set_transparency(materialData.transparency);
+	godotMaterial->set_cull_mode(materialData.cullMode);
+	godotMaterial->set_name(materialData.name);
+	godotMaterial->set_alpha_antialiasing(BaseMaterial3D::ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE);
+	godotMaterial->set_shading_mode(BaseMaterial3D::SHADING_MODE_PER_PIXEL);
+	godotMaterial->set_flag(BaseMaterial3D::FLAG_USE_TEXTURE_REPEAT, false);
 }
 
 Error CesiumGDModelLoader::generate_normals(Vector<Vector3>* normalBuffer, const Vector<Vector3>& vertexBuffer, const Vector<int32_t>& indexBuffer, bool flip /*= false*/)

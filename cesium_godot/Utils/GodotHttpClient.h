@@ -17,7 +17,9 @@ using namespace godot;
 #endif
 
 #include "BRThreadPool.h"
+#include <atomic>
 #include <functional>
+#include <mutex>
 #include <vector>
 #include <string>
 #include <charconv>
@@ -37,7 +39,19 @@ class GodotHttpClient {
 
 public:
 	GodotHttpClient() = default;
-	~GodotHttpClient() = default;
+	~GodotHttpClient() {
+		this->stop();
+	}
+
+	/// @brief Ends the request threads (see CurlHttpClient::stop): no new job is taken, the queued jobs are answered
+	/// empty without a request, and every thread is joined before this returns.
+	void stop(const std::function<void()> &whileWaiting = nullptr) {
+		{
+			std::lock_guard<std::mutex> lock(m_stopMutex);
+			m_stopping = true;
+		}
+		m_threadPool.join(whileWaiting);
+	}
 
 	void init_client(size_t maxThreads) {
 		m_threadPool.init(maxThreads);
@@ -61,7 +75,17 @@ public:
 		std::vector<GodotHeader_t> allHeaders = m_defaultHeaders;
 		allHeaders.insert(allHeaders.end(), headers.begin(), headers.end());
 
+		std::unique_lock<std::mutex> stopLock(m_stopMutex);
+		if (m_stopping) {
+			stopLock.unlock();
+			callback(0, PackedByteArray());
+			return;
+		}
 		m_threadPool.enqueue([this, urlCopy, method, callback, allHeaders] {
+			if (m_stopping) {
+				callback(0, PackedByteArray());
+				return;
+			}
 			int32_t responseCode = 0;
 			PackedByteArray body = perform_request(urlCopy.c_str(), method, &responseCode, allHeaders);
 			callback(responseCode, body);
@@ -262,6 +286,8 @@ private:
 
 	BRThreadPool m_threadPool;
 	std::vector<GodotHeader_t> m_defaultHeaders;
+	std::mutex m_stopMutex;
+	std::atomic<bool> m_stopping{ false };
 };
 
 #endif // GODOT_HTTP_CLIENT_H

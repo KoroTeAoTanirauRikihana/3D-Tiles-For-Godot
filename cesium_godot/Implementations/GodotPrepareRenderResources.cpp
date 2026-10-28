@@ -26,6 +26,7 @@ using namespace godot;
 #include "CesiumGltf/Node.h"
 #include "CesiumGltf/ExtensionModelExtStructuralMetadata.h"
 #include <glm/gtc/quaternion.hpp>
+#include <memory>
 #include "../Models/CesiumGDTileset.h"
 
 using namespace CesiumAsync;
@@ -49,20 +50,13 @@ CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources> Go
 			return;
 		}
 
-		Error err;
-		Ref<ArrayMesh> meshData = CesiumGDModelLoader::generate_meshes_from_model(*movedModel, &err);
-
-		if (err != Error::OK) {
-			String errorMsg = String("Error generating meshes for tile ") + REFLECT_ERR_NAME(err);
-			ERR_PRINT(errorMsg);
-			// Always resolve with nullptr - reject() crashes with LIBASYNC_NO_EXCEPTIONS
-			TileLoadResultAndRenderResources errorResult{ std::move(tileLoadResult), nullptr };
-			p_promise.resolve(errorResult);
+		// The tileset is gone (detach_tileset): make no node for it.
+		Cesium3DTileset* tileset = this->m_tileset;
+		if (tileset == nullptr) {
+			TileLoadResultAndRenderResources droppedResult{ std::move(tileLoadResult), nullptr };
+			p_promise.resolve(droppedResult);
 			return;
 		}
-
-		Cesium3DTile* instance = memnew(Cesium3DTile);
-		instance->set_mesh(meshData);
 
 		// Check if model has nodes before accessing
 		if (movedModel->nodes.empty()) {
@@ -72,68 +66,27 @@ CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources> Go
 			return;
 		}
 
-		const CesiumGltf::Node &rootNode = movedModel->nodes[0];
+		// This runs on a request thread (SimpleTaskProcessor runs the worker tasks inline), so it does CPU work only:
+		// the glTF is decoded into Packed*Arrays, material values and Images. The node, ArrayMesh, materials,
+		// textures and collision are made in prepareInMainThread (Godot, "Thread-safe APIs": "You should avoid
+		// calling functions involving direct interaction with the GPU on other threads, such as creating new textures
+		// or modifying and retrieving image data").
+		auto* meshData = new CesiumGDMeshData();
+		Error err = CesiumGDModelLoader::decode_model(*movedModel, meshData);
 
-		const std::vector<double> &translationArray = rootNode.translation;
-		const std::vector<double> &rotationArray = rootNode.rotation;
-		const std::vector<double> &scaleArray = rootNode.scale;
-
-		Transform3D gdTransform = Transform3D(Basis(), Vector3());
-		gdTransform.scale(Vector3(1, 1, 1));
-		instance->set_transform(gdTransform);
-
-		// glTF scale is optional - default to 1,1,1 if not present
-		Vector3 scale(1.0f, 1.0f, 1.0f);
-		if (scaleArray.size() >= 3) {
-			scale.x = scaleArray[0];
-			scale.y = scaleArray[1];
-			scale.z = scaleArray[2];
+		if (err != Error::OK) {
+			delete meshData;
+			String errorMsg = String("Error generating meshes for tile ") + REFLECT_ERR_NAME(err);
+			ERR_PRINT(errorMsg);
+			// Always resolve with nullptr - reject() crashes with LIBASYNC_NO_EXCEPTIONS
+			TileLoadResultAndRenderResources errorResult{ std::move(tileLoadResult), nullptr };
+			p_promise.resolve(errorResult);
+			return;
 		}
-
-		const glm::dmat4 transformationMat = CesiumMathUtils::array_to_dmat4(rootNode.matrix);
-
-		glm::dvec3 glmPos;
-		glm::dquat glmRot;
-		// Applies for tilesets that 
-		constexpr int32_t worldTerrainId = 1;
-		constexpr int32_t osmBuildingsId = 96188;
-
-		constexpr int32_t translationColumnIndex = 3;
-		glmPos = transformationMat[translationColumnIndex];
-		glmRot = glm::quat_cast(transformationMat);
-
-		Vector3 translation;
-		Quaternion rotation = CesiumMathUtils::from_glm_quat(glmRot);
-		CesiumGeoreference* geoReferenceNode = nullptr;
-
-		if (this->m_tileset->is_georeferenced(&geoReferenceNode)) {
-			real_t scaleFactor = geoReferenceNode->get_scale_factor();
-			instance->set_scale({ scaleFactor, scaleFactor, scaleFactor });
-			translation *= scaleFactor;
-		}
-
-		// Avoid adding as child in the worker thread
-		instance->set_tileset_no_reparent(this->m_tileset);
-
-		// Save this for use later
-		instance->set_original_position(glmPos);
-
-		Vector3 eulerAngles = rotation.get_euler();
-
-		translation = CesiumMathUtils::from_glm_vec3(glmPos);
-		instance->set_position(translation);
-		instance->set_rotation(eulerAngles);
-		if (this->m_tileset->get_create_physics_meshes()) {
-			instance->generate_tile_collision();
-		}
-
-		// Metadata extraction
-		const CesiumGltf::ExtensionModelExtStructuralMetadata* modelMetadata = movedModel->getExtension<CesiumGltf::ExtensionModelExtStructuralMetadata>();
-		instance->add_metadata(movedModel, modelMetadata);
 
 		TileLoadResultAndRenderResources result{
 			std::move(tileLoadResult),
-			static_cast<void*>(instance)
+			static_cast<void*>(meshData)
 		};
 
 		p_promise.resolve(result);
@@ -148,31 +101,124 @@ void* GodotPrepareRenderResources::prepareInMainThread(Tile& tile, void* pLoadTh
 		return nullptr;
 	}
 
+	// cesium-native does not keep the load-thread result past this step (IPrepareRendererResources.h: "the value
+	// returned by prepareInLoadThread will _not_ be automatically preserved and passed to free. If you need to free
+	// that value, do it in this method before returning"): it is deleted on every road out of here.
+	std::unique_ptr<CesiumGDMeshData> meshData(static_cast<CesiumGDMeshData*>(pLoadThreadResult));
+
+	Cesium3DTileset* tileset = this->m_tileset;
+	if (tileset == nullptr) {
+		return nullptr;
+	}
+
 	const Cesium3DTilesSelection::TileContent& content = tile.getContent();
 	const Cesium3DTilesSelection::TileRenderContent* pRenderContent = content.getRenderContent();
 
 	if (pRenderContent == nullptr) {
-		return pLoadThreadResult;
+		return nullptr;
 	}
 
 	const CesiumGltf::Model& model = pRenderContent->getModel();
-	// Apply the transform if any
-	Cesium3DTile* instance = reinterpret_cast<Cesium3DTile*>(pLoadThreadResult);
+	if (model.nodes.empty()) {
+		ERR_PRINT("Tile model has no nodes - cannot render");
+		return nullptr;
+	}
 
+	// Main thread: the tile's ArrayMesh, materials and textures are made here, once.
+	Ref<ArrayMesh> meshResource = CesiumGDModelLoader::create_mesh(*meshData);
+	meshData.reset();
+
+	Cesium3DTile* instance = memnew(Cesium3DTile);
+	instance->set_mesh(meshResource);
+
+	const CesiumGltf::Node &rootNode = model.nodes[0];
+
+	const std::vector<double> &translationArray = rootNode.translation;
+	const std::vector<double> &rotationArray = rootNode.rotation;
+	const std::vector<double> &scaleArray = rootNode.scale;
+
+	Transform3D gdTransform = Transform3D(Basis(), Vector3());
+	gdTransform.scale(Vector3(1, 1, 1));
+	instance->set_transform(gdTransform);
+
+	// glTF scale is optional - default to 1,1,1 if not present
+	Vector3 scale(1.0f, 1.0f, 1.0f);
+	if (scaleArray.size() >= 3) {
+		scale.x = scaleArray[0];
+		scale.y = scaleArray[1];
+		scale.z = scaleArray[2];
+	}
+
+	const glm::dmat4 transformationMat = CesiumMathUtils::array_to_dmat4(rootNode.matrix);
+
+	glm::dvec3 glmPos;
+	glm::dquat glmRot;
+	// Applies for tilesets that 
+	constexpr int32_t worldTerrainId = 1;
+	constexpr int32_t osmBuildingsId = 96188;
+
+	constexpr int32_t translationColumnIndex = 3;
+	glmPos = transformationMat[translationColumnIndex];
+	glmRot = glm::quat_cast(transformationMat);
+
+	Vector3 translation;
+	Quaternion rotation = CesiumMathUtils::from_glm_quat(glmRot);
+	CesiumGeoreference* geoReferenceNode = nullptr;
+
+	if (tileset->is_georeferenced(&geoReferenceNode)) {
+		real_t scaleFactor = geoReferenceNode->get_scale_factor();
+		instance->set_scale({ scaleFactor, scaleFactor, scaleFactor });
+		translation *= scaleFactor;
+	}
+
+	// Not added as a child here: the tileset adds it when the tile is rendered (render_tile_as_node)
+	instance->set_tileset_no_reparent(tileset);
+
+	// Save this for use later
+	instance->set_original_position(glmPos);
+
+	Vector3 eulerAngles = rotation.get_euler();
+
+	translation = CesiumMathUtils::from_glm_vec3(glmPos);
+	instance->set_position(translation);
+	instance->set_rotation(eulerAngles);
+	// Reads the mesh faces back: on the main thread, after the mesh is made
+	if (tileset->get_create_physics_meshes()) {
+		instance->generate_tile_collision();
+	}
+
+	// Metadata extraction
+	const CesiumGltf::ExtensionModelExtStructuralMetadata* modelMetadata = model.getExtension<CesiumGltf::ExtensionModelExtStructuralMetadata>();
+	instance->add_metadata(&model, modelMetadata);
+
+	// Apply the transform if any
 	glm::dmat4 tileTransform = tile.getTransform();
 	tileTransform = CesiumGDModelLoader::apply_rtc_center(model, tileTransform);
 	tileTransform = CesiumGDModelLoader::apply_gltf_up_axis_transform(model, tileTransform);
 	// Then apply the z up
 	glm::dvec3 position = glm::dvec3(CesiumMathUtils::ecef_to_engine(tileTransform[3]));
 	instance->set_original_position(instance->get_original_position() + position);
-	return pLoadThreadResult;
+	return static_cast<void*>(instance);
 }
 
 void GodotPrepareRenderResources::free(Tile& tile, void* pLoadThreadResult, void* pMainThreadResult) noexcept
 {
+	// A tile whose main-thread step never ran (in flight when the tileset was destroyed) hands back its load-thread
+	// result: CPU data only (Packed*Arrays, material values, Images), no node and no server object, so plain
+	// destruction frees it, with or without a tileset. When the main-thread step ran, this is nullptr.
+	delete static_cast<CesiumGDMeshData*>(pLoadThreadResult);
+	// After detach_tileset the tileset node and its tile nodes may already be freed by Godot: touch neither. This
+	// used to run from ~Cesium3DTileset, after Godot had deleted the tile children, and turned a freed
+	// Cesium3DTile* into a Variant for call_deferred on a tileset in its destructor - the access violation at quit.
+	if (this->m_tileset == nullptr) return;
+	auto* instance = static_cast<Cesium3DTile*>(pMainThreadResult);
+	if (instance == nullptr) return;
+	if (instance->get_parent() == nullptr) {
+		memdelete(instance);
+		return;
+	}
 	const auto& tileId = tile.getTileID();
 	uint64_t hash = static_cast<uint64_t>(std::visit(CesiumVariantHash{}, tileId));
-	auto* instance = static_cast<Cesium3DTile*>(pMainThreadResult);
 	this->m_tileset->call_deferred("free_tile", instance, hash);
 }
 
@@ -183,7 +229,8 @@ void GodotPrepareRenderResources::attachRasterInMainThread(const Tile& tile, int
 	auto* meshInstance = static_cast<Cesium3DTile*>(rawRenderResources);
 	if (meshInstance == nullptr) return;
 
-	Ref<ImageTexture> godotTexture = static_cast<ImageTexture*>(pMainThreadRendererResources);
+	if (pMainThreadRendererResources == nullptr) return;
+	Ref<ImageTexture> godotTexture = *static_cast<Ref<ImageTexture>*>(pMainThreadRendererResources);
 	std::string key = rasterTile.getOverlay().getName();
 
 	//Get all primitives (surfaces) in the mesh tile
@@ -250,13 +297,13 @@ void* GodotPrepareRenderResources::prepareRasterInMainThread(CesiumRasterOverlay
 {
 	const CesiumGltf::ImageAsset& imageCesium = *rasterTile.getImage().get();
 	Ref<ImageTexture> godotTexture = CesiumGDTextureLoader::load_image_texture(imageCesium, false, true);
-	godotTexture->reference();
-	return static_cast<void*>(godotTexture.ptr());
+	if (godotTexture.is_null()) return nullptr;
+	// Held as a Ref<> (it was a raw ImageTexture* with a manual reference()), so freeRaster releases it the way
+	// Godot does: the texture is deleted when the last reference goes, never unreferenced through a stale pointer.
+	return static_cast<void*>(new Ref<ImageTexture>(godotTexture));
 }
 
 void GodotPrepareRenderResources::freeRaster(const CesiumRasterOverlays::RasterOverlayTile& rasterTile, void* pLoadThreadResult, void* pMainThreadResult) noexcept
 {
-	auto* rasterMainThreadTexture = static_cast<ImageTexture*>(pMainThreadResult);
-	if (rasterMainThreadTexture == nullptr) return;
-	rasterMainThreadTexture->unreference();
+	delete static_cast<Ref<ImageTexture>*>(pMainThreadResult);
 }

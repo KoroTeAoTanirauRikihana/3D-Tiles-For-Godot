@@ -88,6 +88,10 @@ public:
 		void* pLoadThreadResult,
 		void* pMainThreadResult) noexcept override;
 
+	/// @brief Called by the tileset once its Tileset is destroyed and its request threads are joined: from then on
+	/// nothing here touches the tileset node or a tile node (Godot frees them after _exit_tree).
+	void detach_tileset() { this->m_tileset = nullptr; }
+
 private:
 	Cesium3DTileset* m_tileset;
 	BRThreadPool m_physicsMeshThread;

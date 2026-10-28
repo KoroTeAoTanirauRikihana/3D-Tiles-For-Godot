@@ -20,8 +20,14 @@ void GeoreferencedMesh::_ready() {
 }
 
 void GeoreferencedMesh::apply_position_on_globe(const glm::dvec3& engineOrigin) {
-	glm::dvec3 globalPos = this->m_originalPosition - engineOrigin;
-	this->set_global_position(CesiumMathUtils::from_glm_vec3(globalPos));
+	// The offset from the origin is in the TILESET'S frame (swapped ECEF axes, the same frame the tile's own
+	// rotation lives in), so it is the tile's LOCAL position under the tileset. It used to be set as the GLOBAL
+	// position, which was the same thing only while the georeference (-90 X) and the tileset (+90 X) cancelled
+	// exactly. Once the georeference is levelled at a cartographic origin (level_at_origin), every tile's mesh
+	// turned with the levelled frame while its centre stayed on the unlevelled, tilted surface - a staircase of
+	// slanted plates at eye level, Rapa Nui, 28 Oct 2026 22:07 and 22:10 (187 tiles in the tree, none in place).
+	glm::dvec3 localPos = this->m_originalPosition - engineOrigin;
+	this->set_position(CesiumMathUtils::from_glm_vec3(localPos));
 }
 
 const glm::dvec3& GeoreferencedMesh::get_original_position() const {

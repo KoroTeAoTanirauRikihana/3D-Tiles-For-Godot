@@ -242,6 +242,39 @@ def configure_native(argumentsDict):
     repoDirectory = CESIUM_NATIVE_DIR_EXT if isExt else CESIUM_NATIVE_DIR_MODULE
     repoDirectory = scons_to_abs_path(repoDirectory)
     os.chdir(repoDirectory)
+    # 28 Oct 2026: cesium-native hard-codes its vcpkg commit inside ezvcpkg_fetch(COMMIT ...), and that
+    # vcpkg asks msys2 for msys2-runtime-3.5.4-2, which msys2 has removed (404 on every mirror), so every
+    # build stopped at configure. A cache variable cannot override an explicit COMMIT argument, so when
+    # EZVCPKG_COMMIT is set in the environment (the workflow sets a vcpkg whose msys2 runtime exists), the
+    # COMMIT line of cesium-native's own CMakeLists.txt is rewritten to it before cmake runs. Unset, nothing
+    # changes.
+    pinned = os.environ.get("EZVCPKG_COMMIT", "").strip()
+    if pinned:
+        import re
+        cml = os.path.join(repoDirectory, "CMakeLists.txt")
+        with open(cml, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        new_text, count = re.subn(r"(ezvcpkg_fetch\(\s*COMMIT\s+)[0-9a-f]{40}", lambda m: m.group(1) + pinned, text, count=1)
+        if count:
+            with open(cml, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(new_text)
+            print("EZVCPKG_COMMIT: cesium-native's ezvcpkg_fetch COMMIT rewritten to " + pinned)
+        else:
+            print("EZVCPKG_COMMIT is set but no ezvcpkg_fetch COMMIT line was found in cesium-native's CMakeLists.txt")
+    # 28 Oct 2026, run 40643965153: with vcpkg afc0a2e0 glm is 1.0.2, and cesium-native v0.52.1's
+    # CesiumGltf/src/Model.cpp stops on glm/detail/type_quat.inl(253) 'mat4_cast': identifier not found.
+    # cesium-native fixed it itself between v0.52.1 and v0.54.0 with one include in Model.cpp
+    # (CesiumGS/cesium-native compare v0.52.1...v0.54.0); the same line is added here after the clone.
+    model_cpp = os.path.join(repoDirectory, "CesiumGltf", "src", "Model.cpp")
+    if os.path.isfile(model_cpp):
+        with open(model_cpp, "r", encoding="utf-8") as fh:
+            model_text = fh.read()
+        needle = "#include <glm/geometric.hpp>\n"
+        if "#include <glm/gtc/quaternion.hpp>" not in model_text and needle in model_text:
+            model_text = model_text.replace(needle, needle + "#include <glm/gtc/quaternion.hpp> // cesium-native v0.54.0's fix for glm 1.0.2\n", 1)
+            with open(model_cpp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(model_text)
+            print("Model.cpp: added #include <glm/gtc/quaternion.hpp> (cesium-native's own fix for glm 1.0.2)")
     # Assume you already have the triplet (for now)
     triplet: str = determine_triplet()
     os.environ["VCPKG_TRIPLET"] = triplet
@@ -300,7 +333,7 @@ def compile_native(argumentsDict):
     # TODO: Test if we can just do cmake --build for all platforms
     result = None
     if os.name == OS_WIN:
-        result = build_native_win()
+        result = build_native_win(argumentsDict)
     elif sys.platform == PLATFORM_MACOS:
         result = build_native_macos()
     elif os.name == OS_LINUX:
@@ -309,8 +342,10 @@ def compile_native(argumentsDict):
         print(
             "Compiling for platform %s is not yet supported!" % os.name, file=sys.stderr
         )
-    if result.returncode != 0:
-        print("Error building Cesium Native: %s" % str(result.stderr))
+    if result is None or result.returncode != 0:
+        # Fail here, where the cause is, instead of 30 minutes later at the extension's link step.
+        print("Error building Cesium Native: return code %s" % (None if result is None else result.returncode), file=sys.stderr)
+        exit(1)
     print("Cleaning definitions on generated files...")
     clean_cesium_definitions()
     print("Finished building Cesium Native!")
@@ -324,19 +359,15 @@ def build_native_macos():
     return subprocess.run(["cmake", "--build", "."])
 
 
-def build_native_win():
-    # execute MSBuild
-    buildConfig: str = RELEASE_CONFIG
-    solutionName: str = "cesium-native.sln"
-    msbuildPath: str = find_ms_build()
-    if msbuildPath == "":
-        print(
-            "Could not find MSBuild.exe, make sure to have Visual Studio installed",
-            file=sys.stderr,
-        )
-        return
-    releaseConfig = "/property:Configuration=%s" % buildConfig
-    return subprocess.run([msbuildPath, solutionName, releaseConfig])
+def build_native_win(argumentsDict):
+    buildConfig: str = "RelWithDebInfo" if argumentsDict.get("precision") == "double" else RELEASE_CONFIG
+    # 28 Oct 2026: GitHub's windows-latest image (windows-2025-vs2026) makes CMake 4.4 generate for
+    # "Visual Studio 18 2026", whose solution file is cesium-native.slnx - there is no cesium-native.sln,
+    # so MSBuild answered "MSB1009: Project file does not exist", cesium-native never compiled, and the
+    # extension's link failed later with LNK1181 Cesium3DTilesSelection.lib (run 40639946574, both jobs).
+    # cmake --build drives whatever generator wrote the build files, .sln or .slnx, and --config picks the
+    # configuration on a multi-config generator the same way /property:Configuration did.
+    return subprocess.run(["cmake", "--build", ".", "--config", buildConfig, "--parallel"])
 
 
 def clean_cesium_definitions():
