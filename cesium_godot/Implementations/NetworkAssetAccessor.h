@@ -41,6 +41,9 @@ public:
 
 	void tick() noexcept override;
 
+	// Ends the request pool: in-flight requests end, queued ones are answered with status 0, its threads are joined.
+	void close();
+
 private:
 	CesiumAsync::Future<std::shared_ptr<CesiumAsync::IAssetRequest>> process_request(HTTPClient::Method method, const CesiumAsync::AsyncSystem &asyncSystem, const std::string &url, const std::vector<THeader> &headers = {});
 

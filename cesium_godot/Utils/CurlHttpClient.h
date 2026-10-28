@@ -23,6 +23,7 @@ using namespace godot;
 
 #include "BRThreadPool.h"
 #include <curl/curl.h>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -85,6 +86,12 @@ struct RequestHandle_t {
 
 };
 
+// One count for every CurlHttpClient<N>. A static member of the template is one counter PER N, so the credit panel's
+// client (N = 2) or the token check's (N = 1) could run curl_global_cleanup while the tileset's (N = 100) still had
+// transfers on its threads.
+inline std::mutex g_curlGlobalMutex;
+inline uint32_t g_curlActiveClients = 0;
+
 struct MemoryStruct {
 	char *memory;
 	size_t size;
@@ -97,10 +104,13 @@ class CurlHttpClient {
 
 public:
 	CurlHttpClient() {
-		if (s_activeInstances == 0) {
-			curl_global_init(CURL_GLOBAL_ALL);
+		{
+			std::lock_guard<std::mutex> lock(g_curlGlobalMutex);
+			if (g_curlActiveClients == 0) {
+				curl_global_init(CURL_GLOBAL_ALL);
+			}
+			g_curlActiveClients++;
 		}
-		s_activeInstances++;
 		//Init all handles (a deque: a handle added later never moves the ones a worker thread is using)
 		for (int32_t i = 0; i < N_MAX_HANDLES; i++) {
 			RequestHandle_t handle{};
@@ -110,12 +120,16 @@ public:
 	}
 
 	~CurlHttpClient() {
+		// The pool's threads end BEFORE the handles they transfer on are cleaned up. The members are destroyed after
+		// this body, the pool last of all, so the handles (and curl itself) were gone while a thread still ran on them.
+		this->close();
 		for (int32_t i = 0; i < this->m_activeHandles.size(); i++) {
 			this->m_activeHandles[i].easy_cleanup();
 		}
 
-		s_activeInstances--;
-		if (s_activeInstances == 0) {
+		std::lock_guard<std::mutex> lock(g_curlGlobalMutex);
+		g_curlActiveClients--;
+		if (g_curlActiveClients == 0) {
 			curl_global_cleanup();
 		}
 	}
@@ -123,10 +137,20 @@ public:
 	void init_client(size_t maxThreads) {
 		this->m_threadPool.init(maxThreads);
 		std::string systemInfo = OS::get_singleton()->get_name().utf8().get_data();
-		auto architecture = OS::get_singleton()->get_processor_name().utf8().get_data();
+		std::string architecture = OS::get_singleton()->get_processor_name().utf8().get_data();
 		std::stringstream stream;
 		stream << "Godot3DTiles/1.0 (" << systemInfo << "; " << architecture << ")";	
 		this->add_default_header({"User-Agent", stream.str()});
+	}
+
+	// No transfer starts after this; one in flight ends at curl's next progress call; a request still queued, or
+	// sent after this, is answered at once with status 0. Every pool thread is joined before this returns.
+	void close() {
+		{
+			std::lock_guard<std::mutex> lock(this->m_closeMutex);
+			this->m_closing = true;
+		}
+		this->m_threadPool.shutdown();
 	}
 
 	void send_get(const char* url, const HighLevelResponseCallback_t& callback, const std::vector<CesiumHeader_t>& headers) {
@@ -147,16 +171,31 @@ public:
 		// request with 405 "PUT is not allowed" and tile.googleapis.com answered a tile with 404, run to run at
 		// random, and no tile ever reached the tree. The handle is claimed on the worker, under the lock, so no more
 		// handles are ever in use than threads are running them.
-		this->m_threadPool.enqueue([this, urlCopy, headers, callback, method] {
-			int32_t handleIdx = this->claim_available_handle_index();
-			RequestHandle_t& handle = this->m_activeHandles[handleIdx];
-			handle.configure_http_method(method);
-			long responseCode = 0;
-			PackedByteArray packedData = pull_url(urlCopy.c_str(), handle.curlHandle, &responseCode, headers);
-			//And call the callback methods here
-			callback(responseCode, packedData);
-			this->release_handle(handleIdx);
-		});
+		{
+			std::lock_guard<std::mutex> lock(this->m_closeMutex);
+			if (!this->m_closing) {
+				this->m_threadPool.enqueue([this, urlCopy, headers, callback, method] {
+					if (this->m_closing) {
+						callback(0, PackedByteArray());
+						return;
+					}
+					this->run_request(urlCopy, method, callback, headers);
+				});
+				return;
+			}
+		}
+		callback(0, PackedByteArray());
+	}
+
+	void run_request(const std::string& urlCopy, HTTPClient::Method method, const HighLevelResponseCallback_t& callback, const std::vector<CesiumHeader_t>& headers) {
+		int32_t handleIdx = this->claim_available_handle_index();
+		RequestHandle_t& handle = this->m_activeHandles[handleIdx];
+		handle.configure_http_method(method);
+		long responseCode = 0;
+		PackedByteArray packedData = pull_url(urlCopy.c_str(), handle.curlHandle, &responseCode, headers);
+		//And call the callback methods here
+		callback(responseCode, packedData);
+		this->release_handle(handleIdx);
 	}
 
 
@@ -176,8 +215,6 @@ public:
 	}
 
 private:
-	static inline uint16_t s_activeInstances = 0;
-
 	PackedByteArray pull_url(const char *url, CURL *handle, long*outStatus , const std::vector<CesiumHeader_t> &headers) {
 		PackedByteArray buffer;
 		//Options stuff
@@ -185,6 +222,9 @@ private:
 		curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &CurlHttpClient::write_callback);
 		curl_easy_setopt(handle, CURLOPT_WRITEDATA, &buffer);
 		curl_easy_setopt(handle, CURLOPT_ACCEPT_ENCODING, "");
+		curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, &CurlHttpClient::progress_callback);
+		curl_easy_setopt(handle, CURLOPT_XFERINFODATA, this);
 
 
 		curl_slist* curlHeaders = nullptr;
@@ -210,7 +250,9 @@ private:
 		curl_slist_free_all(curlHeaders);
 		//Then from the result we can do error handling
 		if (code != CURLcode::CURLE_OK) {
-			ERR_PRINT(String("Could not make request to: ") + url + String(" error: ") + itos(code));
+			if (code != CURLcode::CURLE_ABORTED_BY_CALLBACK) {
+				ERR_PRINT(String("Could not make request to: ") + url + String(" error: ") + itos(code));
+			}
 			*outStatus = 0;
 			return PackedByteArray();
 		}
@@ -229,6 +271,11 @@ private:
 		}
 	
 		return realSize;
+	}
+
+	// Non-zero ends the transfer (CURLE_ABORTED_BY_CALLBACK) once the client is closing.
+	static int progress_callback(void *clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+		return reinterpret_cast<CurlHttpClient *>(clientp)->m_closing ? 1 : 0;
 	}
 
 	// Finds a free handle AND marks it taken in one step under the lock. Before, the index was picked by one
@@ -260,6 +307,8 @@ private:
 	std::vector<CesiumHeader_t> m_defaultHeaders;
 	std::deque<RequestHandle_t> m_activeHandles;
 	std::mutex m_handleMutex;
+	std::mutex m_closeMutex;
+	std::atomic<bool> m_closing{ false };
 };
 
 #endif // HIGH_LEVEL_HTTP_CLIENT

@@ -31,6 +31,8 @@ class CesiumGeoreference;
 
 class Cesium3DTile;
 
+class NetworkAssetAccessor;
+
 enum class EBoundingType {
 	None,
 	Sphere,
@@ -122,6 +124,10 @@ public:
 
 	void _ready() override;
 
+	void _exit_tree() override;
+
+	bool is_closing() const;
+
 private:
 
 	void recreate_tileset();
@@ -145,6 +151,10 @@ private:
 	uint32_t update_property_usage_flags(const PropertyInfo& property) const;
 	
 	std::unique_ptr<Cesium3DTilesSelection::Tileset> m_activeTileset = nullptr;
+
+	std::shared_ptr<NetworkAssetAccessor> m_networkAccessor = nullptr;
+
+	bool m_closing = false;
 
 
 	OpaqueTilesetOptions* m_tilesetConfig;
