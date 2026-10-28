@@ -102,6 +102,11 @@ env.Prepend(LIBPATH=vcpkgLibPath)
 root_dir_native = cesium_build_utils.get_root_dir_native()
 current_build_config = ""
 if (os.name  == cesium_build_utils.OS_WIN):
+    if ARGUMENTS.get("precision") == "double":
+        current_build_config = "RelWithDebInfo"
+    else:
+        current_build_config = cesium_build_utils.RELEASE_CONFIG
+else:
     current_build_config = cesium_build_utils.RELEASE_CONFIG
 # Library paths and linking
 libraries = [
@@ -237,6 +242,30 @@ if (os.name == cesium_build_utils.OS_WIN):
         "zlibstatic-ng",
         "libmodpbase64"
     ])
+    # 28 Oct 2026, run 40646456989: with vcpkg afc0a2e0 abseil is 20250512.1, which no longer ships
+    # absl_bad_any_cast_impl, and the hard-coded list above handed it to the linker (LNK1181). A list
+    # written for one abseil breaks on the next; the libraries that exist are the ones on disk. So on
+    # Windows the absl_* names come from the vcpkg install's lib folder when it can be found, the list
+    # above only when it cannot - and zlib's name follows the same rule (zlib.lib or zlibstatic-ng.lib).
+    _vcpkg_root = cesium_build_utils.find_ezvcpkg_path()
+    _lib_dir = "%s/installed/%s/lib" % (_vcpkg_root, cesium_build_utils.determine_triplet()) if _vcpkg_root else ""
+    if _lib_dir and os.path.isdir(_lib_dir):
+        _on_disk = sorted(f[:-4] for f in os.listdir(_lib_dir) if f.endswith(".lib"))
+        _absl_on_disk = [n for n in _on_disk if n.startswith("absl_")]
+        if _absl_on_disk:
+            _dropped = [n for n in libraries if n.startswith("absl_") and n not in _absl_on_disk]
+            libraries = [n for n in libraries if not n.startswith("absl_")] + _absl_on_disk
+            print("abseil: %d libraries taken from %s; %d of the written list not on disk: %s"
+                  % (len(_absl_on_disk), _lib_dir, len(_dropped), ", ".join(_dropped[:6])))
+        for _z in ("zlib", "zlibstatic-ng"):
+            if _z in libraries and _z not in _on_disk:
+                libraries.remove(_z)
+                print("zlib: %s is not in the vcpkg install, not linked" % _z)
+    # 28 Oct 2026, run 40652097792: the newer libcurl (vcpkg afc0a2e0) leaves two Windows symbols unresolved
+    # at the extension's link - __imp_if_nametoindex (zonefrom_url) lives in iphlpapi.lib and
+    # __imp_InitSecurityInterfaceW (Curl_sspi_global_init) in secur32.lib. Both are Windows SDK import
+    # libraries the extension never named; curl's own CMake config links them for its consumers, SCons does not.
+    libraries.extend(["iphlpapi", "secur32"])
 elif sys.platform == cesium_build_utils.PLATFORM_MACOS:
     # Remove litehtml and gumbo from the libraries list - we'll use -force_load instead
     libraries.remove("litehtml")

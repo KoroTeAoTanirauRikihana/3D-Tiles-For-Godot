@@ -363,7 +363,15 @@ void Cesium3DTileset::update_tileset(const Transform3D& cameraTransform)
 
 	glm::dvec3 camPos;
 	if (isGeoreferenced) {
-		camPos = this->m_georeference->get_ecef_position();
+		// The transform handed in comes through the georeference's engine->ECEF transform (the maker's own camera
+		// passes `globe.get_tx_engine_to_ecef() * global_transform`). That transform is the georeference's global
+		// transform inverted - a rotation about engine (0,0,0) with no translation, because the georeference sits
+		// at the engine origin and every tile is placed as its offset from the origin (register_tile). So the
+		// handed origin is the camera's OFFSET from the origin in ECEF axes, not an ECEF position. The maker's
+		// master used the origin itself as the viewer (the camera assumed at engine (0,0,0)); the branch's first
+		// builds used the offset alone - a point a few km from the Earth's centre, nothing selected, no request,
+		// no error, six sky frames on 28 Oct 2026. The viewer is the origin plus the offset, in doubles.
+		camPos = this->m_georeference->get_ecef_position() + CesiumMathUtils::to_glm_dvec3(cameraTransform.origin);
 	}
 	else {
 		camPos = CesiumMathUtils::to_glm_dvec3(cameraTransform.origin);

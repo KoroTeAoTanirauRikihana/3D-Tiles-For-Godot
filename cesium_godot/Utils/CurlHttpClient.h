@@ -23,6 +23,8 @@ using namespace godot;
 
 #include "BRThreadPool.h"
 #include <curl/curl.h>
+#include <deque>
+#include <mutex>
 #include <vector>
 #include <string>
 
@@ -62,14 +64,21 @@ struct RequestHandle_t {
 	}
 
 	void configure_http_method(HTTPClient::Method method) {
+		// The curl handle is reused for every request. CURLOPT_POST and CURLOPT_UPLOAD stay set on it until
+		// something clears them, so once any request had gone out as POST or PUT, every GET after it went out
+		// the same way: on 28 Oct 2026 the ion endpoint request for asset 2275207 arrived at api.cesium.com as a
+		// PUT and was answered 405 "PUT is not allowed". CURLOPT_HTTPGET resets both; every method sets its own.
 		switch (method) {
 			case HTTPClient::METHOD_POST:
-				curl_easy_setopt(this->curlHandle, CURLOPT_POST, 1);
+				curl_easy_setopt(this->curlHandle, CURLOPT_UPLOAD, 0L);
+				curl_easy_setopt(this->curlHandle, CURLOPT_POST, 1L);
 				break;
 			case HTTPClient::METHOD_PUT:
-				curl_easy_setopt(this->curlHandle, CURLOPT_UPLOAD, 1);
+				curl_easy_setopt(this->curlHandle, CURLOPT_POST, 0L);
+				curl_easy_setopt(this->curlHandle, CURLOPT_UPLOAD, 1L);
 				break;
 			default:
+				curl_easy_setopt(this->curlHandle, CURLOPT_HTTPGET, 1L);
 				break;
 		}
 	}
@@ -92,8 +101,7 @@ public:
 			curl_global_init(CURL_GLOBAL_ALL);
 		}
 		s_activeInstances++;
-		this->m_activeHandles.reserve(N_MAX_HANDLES);
-		//Init all handles
+		//Init all handles (a deque: a handle added later never moves the ones a worker thread is using)
 		for (int32_t i = 0; i < N_MAX_HANDLES; i++) {
 			RequestHandle_t handle{};
 			handle.easy_init();
@@ -132,33 +140,35 @@ public:
 	}
 
 	void send_request(const char* url, HTTPClient::Method method, const HighLevelResponseCallback_t& callback, const std::vector<CesiumHeader_t>& headers) {
-		//Get any active handle
-		int32_t handleIdx = this->get_available_handle_index();
-		this->m_activeHandles[handleIdx].available = false;
 		std::string urlCopy = url;
-		this->m_threadPool.enqueue([&, urlCopy, headers, callback, handleIdx] {
+		// Everything the job needs is COPIED in. The lambda here used to open with [&, ...], which captured `method`
+		// by reference - a reference to a parameter of this function, gone by the time a pool thread ran the job.
+		// The thread read whatever lay on that stack slot: on 28 Oct 2026 api.cesium.com answered an ion endpoint
+		// request with 405 "PUT is not allowed" and tile.googleapis.com answered a tile with 404, run to run at
+		// random, and no tile ever reached the tree. The handle is claimed on the worker, under the lock, so no more
+		// handles are ever in use than threads are running them.
+		this->m_threadPool.enqueue([this, urlCopy, headers, callback, method] {
+			int32_t handleIdx = this->claim_available_handle_index();
 			RequestHandle_t& handle = this->m_activeHandles[handleIdx];
 			handle.configure_http_method(method);
-			long responseCode;
+			long responseCode = 0;
 			PackedByteArray packedData = pull_url(urlCopy.c_str(), handle.curlHandle, &responseCode, headers);
 			//And call the callback methods here
 			callback(responseCode, packedData);
-			handle.available = true;
+			this->release_handle(handleIdx);
 		});
 	}
 
 
 	void send_request_same_thread(const char *url, HTTPClient::Method method, const HighLevelResponseCallback_t &callback, const std::vector<CesiumHeader_t> &headers) {
-		//Get any active handle
-		int32_t handleIdx = this->get_available_handle_index();
-		this->m_activeHandles[handleIdx].available = false;
+		int32_t handleIdx = this->claim_available_handle_index();
 		RequestHandle_t &handle = this->m_activeHandles[handleIdx];
 		handle.configure_http_method(method);
-		long responseCode;
+		long responseCode = 0;
 		PackedByteArray packedData = pull_url(url, handle.curlHandle, &responseCode, headers);
 		//And call the callback methods here
 		callback(responseCode, packedData);
-		handle.available = true;
+		this->release_handle(handleIdx);
 	}
 
 	void add_default_header(const CesiumHeader_t& header) {
@@ -178,33 +188,34 @@ private:
 
 
 		curl_slist* curlHeaders = nullptr;
-		for (const CesiumHeader_t& h : headers)
-		{
-			std::string strHeader = h.first + ": ";
-			strHeader += h.second;
-			curlHeaders = curl_slist_append(curlHeaders, strHeader.c_str());
-		}
-
+		// The request's own headers once (they were appended twice), then the client's default headers, which
+		// were announced by a comment and never added.
 		for (const CesiumHeader_t& h : headers) {
 			std::string strHeader = h.first + ": ";
 			strHeader += h.second;
 			curlHeaders = curl_slist_append(curlHeaders, strHeader.c_str());
 		}
-		
-		// Then add default headers
+		for (const CesiumHeader_t& h : this->m_defaultHeaders) {
+			std::string strHeader = h.first + ": ";
+			strHeader += h.second;
+			curlHeaders = curl_slist_append(curlHeaders, strHeader.c_str());
+		}
 
 		curl_easy_setopt(handle, CURLOPT_HTTPHEADER, curlHeaders);
 
-		//Perform the request		
+		//Perform the request
 		CURLcode code = curl_easy_perform(handle);
+		// The header list is curl's until the transfer ends; freed on both roads (it leaked on the error one).
+		curl_easy_setopt(handle, CURLOPT_HTTPHEADER, nullptr);
+		curl_slist_free_all(curlHeaders);
 		//Then from the result we can do error handling
 		if (code != CURLcode::CURLE_OK) {
 			ERR_PRINT(String("Could not make request to: ") + url + String(" error: ") + itos(code));
+			*outStatus = 0;
 			return PackedByteArray();
 		}
 
 		curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, outStatus);
-		curl_slist_free_all(curlHeaders);
 		return buffer;
 	}
 
@@ -220,24 +231,35 @@ private:
 		return realSize;
 	}
 
-	int32_t get_available_handle_index() {
+	// Finds a free handle AND marks it taken in one step under the lock. Before, the index was picked by one
+	// thread and marked taken afterwards, so two threads could pick the same curl handle and run two transfers on it.
+	int32_t claim_available_handle_index() {
+		std::lock_guard<std::mutex> lock(this->m_handleMutex);
 		for (int32_t i = 0; i < this->m_activeHandles.size(); i++)
 		{
-			const RequestHandle_t &handle = this->m_activeHandles.at(i);
+			RequestHandle_t &handle = this->m_activeHandles[i];
 			if (handle.available) {
+				handle.available = false;
 				return i;
 			}
 		}
 		RequestHandle_t handle{};
 		handle.easy_init();
+		handle.available = false;
 		this->m_activeHandles.push_back(handle);
-		return this->m_activeHandles.size() - 1;
+		return static_cast<int32_t>(this->m_activeHandles.size()) - 1;
+	}
+
+	void release_handle(int32_t handleIdx) {
+		std::lock_guard<std::mutex> lock(this->m_handleMutex);
+		this->m_activeHandles[handleIdx].available = true;
 	}
 
 	//Have a thread pool for some batches of requests
 	BRThreadPool m_threadPool;
 	std::vector<CesiumHeader_t> m_defaultHeaders;
-	std::vector<RequestHandle_t> m_activeHandles;
+	std::deque<RequestHandle_t> m_activeHandles;
+	std::mutex m_handleMutex;
 };
 
 #endif // HIGH_LEVEL_HTTP_CLIENT

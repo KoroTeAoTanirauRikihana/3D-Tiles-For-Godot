@@ -9,6 +9,9 @@ on:
 
 env:
   GIT_LFS_SKIP_SMUDGE: "1"
+  # vcpkg master of 27 Oct 2026 (866e9e2): its msys2 runtime (3.4.10-5) is on repo.msys2.org (HTTP 200);
+  # the pinned default asked for 3.5.4-2, which is gone (404). See CesiumBuildUtils.py.
+  EZVCPKG_COMMIT: "afc0a2e01ae104a2474216a2df0e8d78516fd5af"
 
 jobs:
   double:
