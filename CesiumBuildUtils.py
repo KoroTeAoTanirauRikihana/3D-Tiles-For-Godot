@@ -242,6 +242,23 @@ def configure_native(argumentsDict):
     repoDirectory = CESIUM_NATIVE_DIR_EXT if isExt else CESIUM_NATIVE_DIR_MODULE
     repoDirectory = scons_to_abs_path(repoDirectory)
     os.chdir(repoDirectory)
+    # 28 Oct 2026: cesium-native hard-codes its vcpkg commit inside ezvcpkg_fetch(COMMIT ...), and that
+    # vcpkg asks msys2 for msys2-runtime-3.5.4-2, which msys2 has removed (404 on every mirror), so every
+    # build stopped at configure. A cache variable cannot override an explicit COMMIT argument, so when
+    # EZVCPKG_COMMIT is set in the environment (the workflow sets a vcpkg whose msys2 runtime exists), the
+    # COMMIT line of cesium-native's own CMakeLists.txt is rewritten to it before cmake runs. Unset, nothing
+    # changes.
+    pinned = os.environ.get("EZVCPKG_COMMIT", "").strip()
+    if pinned:
+        import re
+        cml = Path(repoDirectory) / "CMakeLists.txt"
+        text = cml.read_text(encoding="utf-8")
+        new_text, count = re.subn(r"(ezvcpkg_fetch\(\s*COMMIT\s+)[0-9a-f]{40}", lambda m: m.group(1) + pinned, text, count=1)
+        if count:
+            cml.write_text(new_text, encoding="utf-8")
+            print("EZVCPKG_COMMIT: cesium-native's ezvcpkg_fetch COMMIT rewritten to " + pinned)
+        else:
+            print("EZVCPKG_COMMIT is set but no ezvcpkg_fetch COMMIT line was found in cesium-native's CMakeLists.txt")
     # Assume you already have the triplet (for now)
     triplet: str = determine_triplet()
     os.environ["VCPKG_TRIPLET"] = triplet
@@ -254,11 +271,6 @@ def configure_native(argumentsDict):
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
             "-DGIT_LFS_SKIP_SMUDGE=1",
             "-DVCPKG_TRIPLET=%s" % triplet,
-            # 28 Oct 2026: the vcpkg commit cesium-native's ezvcpkg pins by default asks msys2 for
-            # msys2-runtime-3.5.4-2, which msys2 has removed (404 on every mirror), so every build died at
-            # configure. A newer vcpkg checkout asks for a runtime that exists. EZVCPKG_COMMIT in the
-            # environment (set by the workflow) chooses it; unset, the default pin stands as before.
-            *(["-DEZVCPKG_COMMIT=%s" % os.environ["EZVCPKG_COMMIT"]] if os.environ.get("EZVCPKG_COMMIT") else []),
             ".",
         ]
     )
