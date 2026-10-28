@@ -23,6 +23,7 @@ using namespace godot;
 
 #include "BRThreadPool.h"
 #include <curl/curl.h>
+#include <cstring>
 #include <atomic>
 #include <deque>
 #include <mutex>
@@ -258,15 +259,24 @@ private:
 		return static_cast<CurlHttpClient *>(clientp)->m_stopping ? 1 : 0;
 	}
 
+	// EVERY BYTE OF EVERY TILE CAME IN ONE push_back AT A TIME. Godot's CowData grows a PackedByteArray by EXACT
+	// size (_alloc_exact in cowdata.h, no doubling), so a 300 KB tile meant 300,000 reallocations and copies on a
+	// request thread, for every tile, forever. Streaming Google's tiles at Kailasa ended at 15 s on 29 Oct 2026
+	// with "Parameter mem is null" at alloc_static - the allocator refused with gigabytes free. curl hands this
+	// callback a whole chunk: the buffer is grown once per chunk and the chunk copied in.
 	static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
 		auto *vectorBuffer = reinterpret_cast<PackedByteArray*>(userp);
-		char *contentCStr = reinterpret_cast<char *>(contents);
 		size_t realSize = size * nmemb;
-
-		for (size_t i = 0; i < realSize; i++) {
-			vectorBuffer->push_back(contentCStr[i]);
+		if (realSize == 0) {
+			return 0;
 		}
-	
+		int64_t had = vectorBuffer->size();
+		int64_t want = had + static_cast<int64_t>(realSize);
+		vectorBuffer->resize(want);
+		if (vectorBuffer->size() != want) {
+			return 0;   // out of room: curl stops this transfer rather than the engine ending
+		}
+		memcpy(vectorBuffer->ptrw() + had, contents, realSize);
 		return realSize;
 	}
 

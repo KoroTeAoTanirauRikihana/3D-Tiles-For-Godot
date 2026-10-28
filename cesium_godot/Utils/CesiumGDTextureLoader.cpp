@@ -1,5 +1,6 @@
 #include "CesiumGDTextureLoader.h"
 #include "CesiumGltf/ImageAsset.h"
+#include <cstring>
 #include "godot_cpp/core/error_macros.hpp"
 #include "error_names.hpp"
 
@@ -17,14 +18,19 @@ Ref<ImageTexture> CesiumGDTextureLoader::load_image_texture(const CesiumGltf::Im
 
 Ref<Image> CesiumGDTextureLoader::load_image(const CesiumGltf::ImageAsset& image, bool generateMipMaps, bool imageHasMipMaps)
 {
-	//TODO: we can probably optimize this
-	PackedByteArray rawImageData;
+	// THE BYTES ARE COPIED ONCE, NOT ONE AT A TIME. Every tile's texture used to be built with a push_back per
+	// byte: Godot's CowData grows a PackedByteArray by EXACT size (_alloc_exact, no doubling), so a 256x256 RGBA8
+	// image meant 262,144 reallocations and about 34 GB of memory traffic for one tile. Streaming Google's tiles
+	// at Kailasa on 29 Oct 2026 ended at 15 s every run with "Parameter mem is null" at alloc_static and
+	// "_alloc_exact" in cowdata.h - the allocator refused, with gigabytes of the machine still free. One resize
+	// and one memcpy: the same bytes, one allocation.
 	size_t pixelSize = image.pixelData.size();
-
-	for (size_t i = 0; i < pixelSize; ++i)
-	{
-		const std::byte& element = image.pixelData.at(i);
-		rawImageData.push_back(static_cast<uint8_t>(element));
+	PackedByteArray rawImageData;
+	if (pixelSize > 0) {
+		rawImageData.resize(static_cast<int64_t>(pixelSize));
+		ERR_FAIL_COND_V_MSG(static_cast<size_t>(rawImageData.size()) != pixelSize, Ref<Image>(),
+			"Could not make room for this tile's texture");
+		memcpy(rawImageData.ptrw(), image.pixelData.data(), pixelSize);
 	}
 
 	Image::Format cesiumFormat;
