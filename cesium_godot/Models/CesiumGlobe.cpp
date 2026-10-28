@@ -445,7 +445,11 @@ void CesiumGeoreference::_update_transform() {
 			(swap.xform(eus.get_column(1))).normalized(), // Up -> Y
 			(swap.xform(eus.get_column(2))).normalized()  // South -> Z
 		);
-		this->set_global_basis(m.inverse() * this->get_global_basis());
+		// Node3D::get_global_basis/set_global_basis are not in the godot-cpp this extension builds against
+		// (run 40635934370, 28 Oct 2026: C2039 in both jobs); the transform road exists in every Godot 4.
+		Transform3D levelled = this->get_global_transform();
+		levelled.basis = m.inverse() * levelled.basis;
+		this->set_global_transform(levelled);
 	}
 }
 
