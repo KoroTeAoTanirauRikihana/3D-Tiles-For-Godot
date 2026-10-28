@@ -363,7 +363,11 @@ void Cesium3DTileset::update_tileset(const Transform3D& cameraTransform)
 
 	glm::dvec3 camPos;
 	if (isGeoreferenced) {
-		camPos = CesiumMathUtils::to_glm_dvec3(this->m_georeference->get_tx_engine_to_ecef().xform(cameraTransform.origin));
+		// The transform handed in is ALREADY in ECEF: the maker's own camera (AbstractCesiumCamera._update_tilesets)
+		// passes `globe.get_tx_engine_to_ecef() * global_transform`. Converting its origin again (the branch's first
+		// change) put the viewer off the planet and no tile was ever chosen - "tiles in the tree 0" on 28 Oct 2026.
+		// The viewer is the camera, taken as it is given.
+		camPos = CesiumMathUtils::to_glm_dvec3(cameraTransform.origin);
 	}
 	else {
 		camPos = CesiumMathUtils::to_glm_dvec3(cameraTransform.origin);
