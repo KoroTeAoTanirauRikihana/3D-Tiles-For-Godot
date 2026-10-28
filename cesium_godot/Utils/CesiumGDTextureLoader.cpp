@@ -8,6 +8,15 @@ constexpr int32_t RGB_CHANNEL_COUNT = 3;
 
 Ref<ImageTexture> CesiumGDTextureLoader::load_image_texture(const CesiumGltf::ImageAsset& image, bool generateMipMaps, bool imageHasMipMaps)
 {
+	Ref<Image> godotImage = load_image(image, generateMipMaps, imageHasMipMaps);
+	if (godotImage.is_null()) {
+		return Ref<ImageTexture>();
+	}
+	return ImageTexture::create_from_image(godotImage);
+}
+
+Ref<Image> CesiumGDTextureLoader::load_image(const CesiumGltf::ImageAsset& image, bool generateMipMaps, bool imageHasMipMaps)
+{
 	//TODO: we can probably optimize this
 	PackedByteArray rawImageData;
 	size_t pixelSize = image.pixelData.size();
@@ -20,7 +29,7 @@ Ref<ImageTexture> CesiumGDTextureLoader::load_image_texture(const CesiumGltf::Im
 
 	Image::Format cesiumFormat;
 	Error err = try_get_image_format(image.channels, image.bytesPerChannel, &cesiumFormat);
-	ERR_FAIL_COND_V_MSG(err != Error::OK, Ref<ImageTexture>(), "Image format not recognized!");
+	ERR_FAIL_COND_V_MSG(err != Error::OK, Ref<Image>(), "Image format not recognized!");
 
 	// THE DATA SAYS WHETHER IT CARRIES A MIP CHAIN, NOT THE CALLER. 29 Oct 2026 04:0x, Mai World streaming Google's
 	// tiles at Kailasa: Godot's "Data for slice index 0 ... differs in size (supplied: 262144) than what is
@@ -43,7 +52,7 @@ Ref<ImageTexture> CesiumGDTextureLoader::load_image_texture(const CesiumGltf::Im
 	if (imageHasMipMaps && !dataHasMipMaps) {
 		generateMipMaps = generateMipMaps || pixelSize == baseBytes;
 	}
-	ERR_FAIL_COND_V_MSG(pixelSize != baseBytes && pixelSize != chainBytes, Ref<ImageTexture>(),
+	ERR_FAIL_COND_V_MSG(pixelSize != baseBytes && pixelSize != chainBytes, Ref<Image>(),
 		"Cesium image byte count matches neither its base image nor a full mip chain - not uploaded");
 
 	Ref<Image> godotImage = Image::create_from_data(
@@ -62,8 +71,7 @@ Ref<ImageTexture> CesiumGDTextureLoader::load_image_texture(const CesiumGltf::Im
 		}
 
 	}
-	Ref<ImageTexture> textureToUse = ImageTexture::create_from_image(godotImage);
-  return textureToUse;
+	return godotImage;
 }
 
 Error CesiumGDTextureLoader::try_get_image_format(int32_t channelCount, int32_t bytesPerChannel, Image::Format* outFormat)
